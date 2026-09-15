@@ -124,9 +124,21 @@ def test_a_larger_cap_is_never_smaller_than_a_tighter_one():
 
 
 def test_no_cap_is_unchanged():
-    """max_split_per_batch <= 0 means 'no cap' and must not enter the branch,
-    so the sizing has to match the historical value exactly."""
-    assert _reduce_partial_map_size(64, -1) == _reduce_partial_map_size(64, 0)
+    """-1 means 'no cap' and must not enter the branch, so the sizing has to
+    match the historical value exactly.
+
+    Deliberately asserts -1 only, NOT 0. The two are equivalent to this sizing
+    helper -- both fail the `> 0` guard -- but they are not equivalent to the
+    planner, so treating them as interchangeable would advertise a contract the
+    library does not honour: v1.2 computes
+    `num_splits = min(num_clusters, max_split_per_batch * num_batches)` and
+    `auto_split = (max_split_per_batch < 0)`, so 0 gives num_splits == 0 with
+    auto_split false, and mla_v12_effective_splits returns that 0 unclamped (the
+    `max(1, ...)` applies only on the auto path). 0 therefore means ZERO splits
+    to the fill, not 'unlimited'. Use -1.
+    """
+    uncapped = _reduce_partial_map_size(64, -1)
+    assert _reduce_partial_map_size(64, -2) == uncapped
 
 
 @pytest.mark.parametrize("batch_size", [1, 8, 64])
