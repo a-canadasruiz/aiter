@@ -91,9 +91,7 @@ def _plan(batch_size, cap, ctx_len, jitter, slack=1, nhead=NHEAD):
         device="cuda",
     )
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
-    kv_indptr[1:] = torch.tensor(
-        kv_lens, dtype=torch.int32, device="cuda"
-    ).cumsum(0)
+    kv_indptr[1:] = torch.tensor(kv_lens, dtype=torch.int32, device="cuda").cumsum(0)
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int32, device="cuda")
 
     aiter.get_mla_metadata_v1(
