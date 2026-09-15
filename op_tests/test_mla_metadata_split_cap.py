@@ -87,9 +87,9 @@ def test_a_tight_cap_actually_shrinks_the_allocation(batch_size):
     Measured on gfx950, reduce_partial_map entries at nhead=128, qo_len=4:
 
         batch   uncapped   cap=1   cap=256
-            1       1024      12       260
-            8       1052      96       288
-           64       1276     512       512
+            1       1024       5       260
+            8       1052      40       288
+           64       1276     320       512
     """
     uncapped = _reduce_partial_map_size(batch_size, max_split_per_batch=-1)
     capped = _reduce_partial_map_size(batch_size, max_split_per_batch=1)
@@ -169,8 +169,33 @@ def main():
     test_a_non_constraining_cap_does_not_change_the_size()
     test_a_larger_cap_is_never_smaller_than_a_tighter_one()
     test_no_cap_is_unchanged()
+    test_the_native_gate_matches_the_kernel()
     aiter.logger.info("mla metadata split-cap sizing tests: all passed")
 
 
 if __name__ == "__main__":
     main()
+
+
+def test_the_native_gate_matches_the_kernel():
+    """The fold is applied iff the planner folds, per v1_2_device.cuh:910-921.
+
+    Getting this backwards is the dangerous direction: claiming a folded shape
+    is native under-reserves, and an undersized reduce_partial_map faults the
+    GPU rather than raising. gfx950 fp8 serves 32/64/96/128 natively; 48 is not
+    on that list and folds to 16 with qk_batch_ratio 3.
+    """
+    from aiter.ops.attention import _mla_v12_natively_supported as native
+
+    if aiter.get_gfx() != "gfx950":
+        pytest.skip("head classification below is specific to gfx950")
+    for nhead in (32, 64, 96, 128):
+        assert native(nhead, MAX_SEQLEN_QO, dtypes.fp8, dtypes.fp8), (
+            f"nhead={nhead} is natively served on gfx950 fp8; treating it as "
+            f"folded reserves a qk_batch_ratio the planner never applies"
+        )
+    assert not native(48, MAX_SEQLEN_QO, dtypes.fp8, dtypes.fp8), (
+        "nhead=48 is NOT natively served on gfx950 fp8, so the planner folds it "
+        "to 16 and triples its batch count before applying the cap -- sizing "
+        "that misses the fold under-reserves and faults the GPU"
+    )

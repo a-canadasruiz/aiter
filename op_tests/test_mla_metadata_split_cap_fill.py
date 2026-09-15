@@ -59,7 +59,7 @@ def _kv_lens(batch_size, ctx_len, jitter):
     return [rng.randint(max(1, ctx_len // 2), ctx_len) for _ in range(batch_size)]
 
 
-def _plan(batch_size, cap, ctx_len, jitter, slack=1):
+def _plan(batch_size, cap, ctx_len, jitter, slack=1, nhead=NHEAD):
     """Allocate from the sizing, run the planner, return the buffers.
 
     `slack` multiplies every buffer so a tight allocation can be compared
@@ -68,7 +68,7 @@ def _plan(batch_size, cap, ctx_len, jitter, slack=1):
     sizes = aiter.get_mla_metadata_info_v1(
         batch_size,
         MAX_SEQLEN_QO,
-        NHEAD,
+        nhead,
         dtypes.fp8,
         dtypes.fp8,
         is_sparse=False,
@@ -100,7 +100,7 @@ def _plan(batch_size, cap, ctx_len, jitter, slack=1):
         qo_indptr,
         kv_indptr,
         kv_last_page_lens,
-        NHEAD // KIMI_NHEAD_KV,
+        nhead // KIMI_NHEAD_KV,
         KIMI_NHEAD_KV,
         IS_CAUSAL,
         outs["work_meta_data"],
@@ -214,8 +214,34 @@ def main():
         test_the_fit_check_is_not_vacuous(batch_size, cap, ctx_len, jitter)
         test_a_tight_buffer_matches_an_oversized_one(batch_size, cap, ctx_len, jitter)
     test_the_tightest_allocation_does_not_overflow()
+    for nhead, cap in ((48, 256),):
+        test_a_folded_head_count_still_fits(nhead, cap)
     aiter.logger.info("mla metadata split-cap fill tests: all passed")
 
 
 if __name__ == "__main__":
     main()
+
+
+# gfx950 fp8 serves 32/64/128 heads natively but NOT 48, so the planner folds 48
+# to 16 and triples its batch count before applying the cap
+# (v1_2_device.cuh:910-928). Only cap=256 is used: cap 1 and 4 write ZERO
+# partials at this shape, so `0 <= bound` would pass for any bound at all.
+#
+# NOTE this row does not *discriminate* the fold -- measured, the planner never
+# comes close to its own budget (batch 1 / cap 85 writes 88 partials against a
+# folded budget of 255), so dropping the fold does not overflow any shape found
+# by sweeping batch x cap. The fold is justified from the C++ budget expression,
+# not from an observed overflow. test_the_native_gate_matches_the_kernel below
+# pins the classification; the fold's necessity rests on the source.
+@pytest.mark.parametrize("nhead,cap", [(48, 256)])
+def test_a_folded_head_count_still_fits(nhead, cap):
+    outs = _plan(1, cap, 65536, jitter=False, nhead=nhead)
+    filled = int(outs["reduce_indptr"][-1])
+    bound = outs["reduce_partial_map"].numel()
+    assert filled <= bound, (
+        f"nhead={nhead} cap={cap}: planner wrote {filled} partials into a "
+        f"{bound}-entry reduce_partial_map -- the qk_batch_ratio fold was not "
+        f"applied to the sizing"
+    )
+    print(f"\n  nhead={nhead:>4} cap={cap:>4}  partials={filled:>5}/{bound:<5}")
