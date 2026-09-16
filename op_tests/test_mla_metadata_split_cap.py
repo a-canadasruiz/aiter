@@ -176,8 +176,6 @@ def main():
     aiter.logger.info("mla metadata split-cap sizing tests: all passed")
 
 
-
-
 def test_the_native_gate_matches_the_kernel():
     """The fold is applied iff the planner folds, per v1_2_device.cuh:910-921.
 
@@ -200,6 +198,7 @@ def test_the_native_gate_matches_the_kernel():
         "to 16 and triples its batch count before applying the cap -- sizing "
         "that misses the fold under-reserves and faults the GPU"
     )
+
 
 if __name__ == "__main__":
     main()

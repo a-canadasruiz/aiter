@@ -1144,7 +1144,14 @@ def _mla_v12_natively_supported(num_head_qo, max_seqlen_qo, q_dtype, kv_dtype):
         and is_experimental_enabled()
     )
 
-    flydsl_ps1 = os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") not in ("0", "")
+    # `== "1"` matches the convention already used for this variable in
+    # get_mla_metadata_info_v1 below. It is deliberately STRICTER than the
+    # C++ `atoi(value) != 0`: a value like "2" reads as enabled there and
+    # disabled here, so we fold where the planner does not, which only
+    # over-reserves. The reverse -- treating "false" as enabled, as a
+    # truthiness test would -- reports native for a shape the planner folds
+    # and under-reserves reduce_partial_map, which faults the GPU.
+    flydsl_ps1 = os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
     gfx1250_flydsl_ps1_heads = (
         flydsl_ps1
         and gfx == "gfx1250"
