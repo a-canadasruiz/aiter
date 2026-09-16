@@ -450,6 +450,7 @@ def test_mha_int64_strides(
         )
 
     # NOTE: use fwd output to wait not exit program before kernel finishes
+    torch.cuda.synchronize()
     logger.info("triton_out: %s", triton_out)
     if test_backward:
         logger.info("triton_dq: %s %s", triton_dq.shape, triton_dq.stride())
