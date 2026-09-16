@@ -160,6 +160,34 @@ def test_non_fast_mode_ignores_the_cap(batch_size):
         )
 
 
+def _check_gfx1250_gate_without_pytest():
+    """main() has no monkeypatch fixture, so patch and restore by hand."""
+    import os as _os
+
+    import aiter.ops.attention as attention_ops
+
+    saved_gfx = attention_ops.get_gfx
+    saved_env = _os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL")
+    try:
+        attention_ops.get_gfx = lambda: "gfx1250"
+        for env, expected in (("1", True), ("0", False), ("false", False)):
+            _os.environ["AITER_MLA_DECODE_PS1_FLYDSL"] = env
+            for nhead in (32, 64, 128):
+                got = attention_ops._mla_v12_natively_supported(
+                    nhead, 1, dtypes.fp8, dtypes.fp8
+                )
+                assert got is expected, (
+                    f"gfx1250 nhead={nhead} env={env!r}: native={got}, "
+                    f"expected {expected}"
+                )
+    finally:
+        attention_ops.get_gfx = saved_gfx
+        if saved_env is None:
+            _os.environ.pop("AITER_MLA_DECODE_PS1_FLYDSL", None)
+        else:
+            _os.environ["AITER_MLA_DECODE_PS1_FLYDSL"] = saved_env
+
+
 def main():
     """aiter's CI runs each op_tests module with `python3`, not pytest."""
     for batch_size in (1, 8, 64):
@@ -173,6 +201,7 @@ def main():
     # it and let the exception escape the python3 launcher.
     if aiter.get_gfx() == "gfx950":
         test_the_native_gate_matches_the_kernel()
+    _check_gfx1250_gate_without_pytest()
     aiter.logger.info("mla metadata split-cap sizing tests: all passed")
 
 
@@ -198,6 +227,46 @@ def test_the_native_gate_matches_the_kernel():
         "to 16 and triples its batch count before applying the cap -- sizing "
         "that misses the fold under-reserves and faults the GPU"
     )
+
+
+@pytest.mark.parametrize(
+    "env,expected_native", [("1", True), ("0", False), ("false", False)]
+)
+def test_the_gfx1250_flydsl_ps1_gate(monkeypatch, env, expected_native):
+    """gfx1250 PS1 is native ONLY with AITER_MLA_DECODE_PS1_FLYDSL enabled.
+
+    Runs on any device by patching get_gfx, because the arch that exercises this
+    branch is not the one in CI. Without the env var the planner folds 32/64/128
+    heads to 16, so reporting native here would drop qk_batch_ratio and
+    under-size reduce_partial_map.
+
+    "false" is included deliberately: a truthiness test would read it as enabled
+    and take the unsafe branch. The C++ uses atoi() != 0, which also rejects it.
+    """
+    import aiter.ops.attention as attention_ops
+
+    monkeypatch.setattr(attention_ops, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setenv("AITER_MLA_DECODE_PS1_FLYDSL", env)
+    for nhead in (32, 64, 128):
+        assert (
+            attention_ops._mla_v12_natively_supported(nhead, 1, dtypes.fp8, dtypes.fp8)
+            is expected_native
+        ), (
+            f"gfx1250 nhead={nhead} qlen=1 with "
+            f"AITER_MLA_DECODE_PS1_FLYDSL={env!r}: expected native="
+            f"{expected_native}"
+        )
+
+
+def test_the_gfx1250_gate_needs_qlen_one(monkeypatch):
+    """The C++ gate requires max_seqlen_qo == 1; longer queries still fold."""
+    import aiter.ops.attention as attention_ops
+
+    monkeypatch.setattr(attention_ops, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setenv("AITER_MLA_DECODE_PS1_FLYDSL", "1")
+    assert not attention_ops._mla_v12_natively_supported(
+        128, 4, dtypes.fp8, dtypes.fp8
+    ), "gfx1250 PS1 is qlen=1 only; qlen=4 must still fold"
 
 
 if __name__ == "__main__":

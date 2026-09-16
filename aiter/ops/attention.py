@@ -1310,6 +1310,10 @@ def get_mla_metadata_info_v1(
         else:
             max_qo_tiles_per_batch = math.ceil(packed_qo_len / 128)
 
+    # The planner's split budget is computed from the raw KV batch count
+    # (`seqlens_kv_indptr.size(0) - 1`, v1_2_device.cuh:860), NOT from this
+    # sparse-expanded one, so keep the original for per_tile_cap below.
+    kv_batch_size = batch_size
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     tile_cnt = batch_size * max_qo_tiles_per_batch
 
@@ -1334,12 +1338,17 @@ def get_mla_metadata_info_v1(
     # forbids. With cudagraph batch_size >> cu_num that product collapsed to
     # tile_cnt * cu_num (e.g. 512 * 256 = 131072), and aiter mla_decode_fwd sizes
     # its fp32 `logits` from reduce_partial_map.size(0) -> ~32 GiB OOM at capture.
-    # Only for fast_mode. fast_mode=False dispatches to get_mla_metadata_v1_1
-    # (csrc/kernels/mla/metadata.cu:148), whose device entry point takes no
-    # max_split_per_batch at all -- compare get_mla_metadata_v1_0_device just
-    # above it, which does. That planner is therefore uncapped, and reducing the
-    # size for it would undersize reduce_partial_map, which faults the GPU
-    # rather than raising.
+    # Only for fast_mode. With fast_mode=False and intra_batch_mode=False,
+    # metadata.cu:148 dispatches to get_mla_metadata_v1_1, whose device entry
+    # point takes no max_split_per_batch at all, so that planner is uncapped and
+    # shrinking its allocation would undersize reduce_partial_map -- which faults
+    # the GPU rather than raising.
+    #
+    # fast_mode=False WITH intra_batch_mode=True is different: metadata.cu:127
+    # routes it to get_mla_metadata_v1_0_device, which does accept the cap. That
+    # path is left out only because its reduce_partial_map sizing above
+    # (`tile_cnt * num_kv_splits`) ignores the cap entirely and is a separate
+    # change; it is not that the planner there is uncapped.
     if fast_mode and max_split_per_batch > 0:
         # The planner folds head counts it does not natively serve down to 16
         # and scales its batch count up by the same ratio BEFORE applying the
@@ -1353,7 +1362,7 @@ def get_mla_metadata_info_v1(
         ):
             qk_batch_ratio = num_head_qo // 16
         per_tile_cap = min(
-            max_splits, max_split_per_batch * batch_size * qk_batch_ratio
+            max_splits, max_split_per_batch * kv_batch_size * qk_batch_ratio
         )
         # Take the min. `tile_cnt + per_tile_cap` is the cap-aware bound; the
         # fast_mode estimate above assumes an unbounded per-batch split budget,

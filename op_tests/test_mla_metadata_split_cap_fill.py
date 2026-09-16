@@ -113,6 +113,13 @@ def _plan(batch_size, cap, ctx_len, jitter, slack=1, nhead=NHEAD):
         uni_seqlen_qo=UNI_SEQLEN_QO,
         fast_mode=True,
         max_split_per_batch=cap,
+        # MUST match the dtypes the sizing call above used. Omitting these makes
+        # the C++ planner default BOTH to bf16 (csrc/kernels/mla/metadata.cu:89),
+        # and the native-support gate is dtype-dependent: on gfx942 nhead=128 is
+        # native in fp8 but folds to 16 heads in bf16, so a sized-for-fp8 buffer
+        # would be filled by a planner using an 8x larger effective batch.
+        dtype_q_nope=dtypes.fp8,
+        dtype_kv_nope=dtypes.fp8,
     )
     torch.cuda.synchronize()
     return outs
