@@ -217,8 +217,6 @@ def main():
     aiter.logger.info("mla metadata split-cap fill tests: all passed")
 
 
-if __name__ == "__main__":
-    main()
 
 
 # gfx950 fp8 serves 32/64/128 heads natively but NOT 48, so the planner folds 48
@@ -243,3 +241,6 @@ def test_a_folded_head_count_still_fits(nhead, cap):
         f"applied to the sizing"
     )
     print(f"\n  nhead={nhead:>4} cap={cap:>4}  partials={filled:>5}/{bound:<5}")
+
+if __name__ == "__main__":
+    main()

@@ -169,12 +169,13 @@ def main():
     test_a_non_constraining_cap_does_not_change_the_size()
     test_a_larger_cap_is_never_smaller_than_a_tighter_one()
     test_no_cap_is_unchanged()
-    test_the_native_gate_matches_the_kernel()
+    # pytest.skip() raises outside a pytest run, so gate rather than call
+    # it and let the exception escape the python3 launcher.
+    if aiter.get_gfx() == "gfx950":
+        test_the_native_gate_matches_the_kernel()
     aiter.logger.info("mla metadata split-cap sizing tests: all passed")
 
 
-if __name__ == "__main__":
-    main()
 
 
 def test_the_native_gate_matches_the_kernel():
@@ -199,3 +200,6 @@ def test_the_native_gate_matches_the_kernel():
         "to 16 and triples its batch count before applying the cap -- sizing "
         "that misses the fold under-reserves and faults the GPU"
     )
+
+if __name__ == "__main__":
+    main()
