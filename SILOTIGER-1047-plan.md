@@ -202,12 +202,15 @@ separate steps (plumbing → live AMD → #4882 → rocprof).
       Family A GQA is not launched on Gluon. Kernels:
       `aiter/ops/triton/_gluon_kernels/gfx950/attention/qsa_{paged_mqa_logits,sparse_paged_gqa}.py`.
 - [ ] Family A table and family B table; never merge them.
-- [ ] rocprof **one real QSA layer** (indexer through GQA) at short and long
-      `L`, including HIP graph replay at decode.
-- [ ] Record whether **indexer or GQA dominates** on this GPU at 8k / 32k /
-      128k (and 1M if the machine can hold it). That result **sets the order
-      of phases 2 vs 3** if it clearly disagrees with “K1 then K2”; note the
-      override here rather than silently swapping.
+- [x] rocprof **one real QSA layer** (indexer through GQA) at short and long
+      `L`, including HIP graph replay at decode. Driver:
+      `tickets/1047/profile_qsa_layer.py`; notes in `tickets/1047/README.md`
+      (phase 1e). Full layer HIP graph captured at decode `M=1`.
+- [x] Record whether **indexer or GQA dominates** on this GPU at 8k / 32k /
+      128k (and 1M if the machine can hold it). **No swap of phases 2 vs 3.**
+      Decode: select wall time dominates GQA (fallback top-k, not MQA µs).
+      Prefill `M=512`: GQA slightly ahead at 8k; select ahead at 32k. 128k
+      decode fits; 1M not run.
 - [ ] **Done when:** both family tables exist with live AMD + oracle + #4882
       where it dispatches; a short note states which side of QSA dominates at
       the locked lengths on GPU 6.
