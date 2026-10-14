@@ -378,6 +378,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         info_keys,
         useSplitK,
         seed,
+        args,
     ):
         _gfx, _cu_num, M, N, K, q_dtype_w = info_keys
         if eval(q_dtype_w) != dtypes.fp8:
@@ -444,6 +445,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         info_keys,
         useSplitK,
         seed,
+        args,
     ):
         _gfx, _cu_num, M, N, K, q_dtype_w = info_keys
         if eval(q_dtype_w) != dtypes.fp8:
@@ -507,11 +509,12 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         info_keys,
         useSplitK,
         seed,
+        args,
     ):
         gfx, _cu_num, M, N, K, q_dtype_w = info_keys
 
         if gfx == "gfx1250":
-            return self._get_flydsl_tune_task_gfx1250(info_keys, seed)
+            return self._get_flydsl_tune_task_gfx1250(info_keys, seed, args)
 
         q_dtype_eval = eval(q_dtype_w)
         q_dtype_name = _Q_DTYPE_W_NAMES.get(q_dtype_eval)
@@ -577,7 +580,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                     )
         return tasks
 
-    def _get_flydsl_tune_task_gfx1250(self, info_keys, seed):
+    def _get_flydsl_tune_task_gfx1250(self, info_keys, seed, args):
         """gfx1250 WMMA ptpc tuning tasks for the FlyDSL libtype."""
         _gfx, _cu_num, M, N, K, q_dtype_w = info_keys
         if eval(q_dtype_w) != dtypes.fp8:
@@ -661,6 +664,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                         info_keys,
                         useSplitK,
                         seed,
+                        args,
                     )
                 )
             if "all" in args.libtype or "cktile" in args.libtype:
@@ -669,6 +673,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                         info_keys,
                         useSplitK,
                         seed,
+                        args,
                     )
                 )
             if "all" in args.libtype or "asm" in args.libtype:
@@ -679,6 +684,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                         info_keys,
                         useSplitK,
                         seed,
+                        args,
                     )
                 )
 
