@@ -34,6 +34,38 @@ def _read_csv(filepath, **kwargs):
     return df
 
 
+def _write_csv(df, filepath, **kwargs):
+    """Write df to filepath so readers see either the old or the new file.
+
+    Tuned CSVs are read by inference; a run killed mid-write must not leave a
+    truncated one. Writes a temp file in the same directory, then os.replace().
+    """
+    filepath = os.path.realpath(filepath)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(filepath),
+        prefix=f".{os.path.basename(filepath)}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", newline="") as f:
+            df.to_csv(f, **kwargs)
+        if os.path.exists(filepath):
+            shutil.copymode(filepath, tmp_path)
+        else:
+            os.chmod(tmp_path, 0o666 & ~_current_umask())
+        os.replace(tmp_path, filepath)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def _current_umask():
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
 class TunerCommon:
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         "verbose": False,
@@ -471,7 +503,7 @@ class TunerCommon:
             subset=dedup_keys,
             keep="last",
         )
-        tunedf.to_csv(tune_file, index=False)
+        _write_csv(tunedf, tune_file, index=False)
 
     def get_cu_num(self):
         gpu = torch.cuda.current_device()
@@ -494,7 +526,7 @@ class TunerCommon:
             else:
                 old_df = pd.DataFrame(columns=self.columns)
             profiledf = pd.concat([old_df, profiledf], ignore_index=True)
-            profiledf.to_csv(args.profile_file, index=False, na_rep="Null")
+            _write_csv(profiledf, args.profile_file, index=False, na_rep="Null")
 
         if fast_mode or topk == -1:
             return rets
@@ -1288,7 +1320,7 @@ class TunerCommon:
                     batch_compare_output_file,
                     batch_compare_plan,
                 )
-                final_df.to_csv(output_file, index=False)
+                _write_csv(final_df, output_file, index=False)
                 if os.path.exists(output_file):
                     self.sortResults(output_file, args.sort, self.sort_keys)
                 self.tunedf = self.get_tuned_gemm_list(output_file)
@@ -1691,7 +1723,7 @@ class GemmCommonTuner(TunerCommon):
             resultdf = self.update_tunedf(old_df, update_tunedf)
         else:
             resultdf = pd.concat([old_df, update_tunedf], ignore_index=True)
-        resultdf.to_csv(file, index=False, na_rep="Null")
+        _write_csv(resultdf, file, index=False, na_rep="Null")
 
     def update_tflops_bw(self, file):
         resultdf = self.get_tuned_gemm_list(file)
@@ -1716,7 +1748,7 @@ class GemmCommonTuner(TunerCommon):
             resultdf.loc[i, "tflops"] = tflops
             resultdf.loc[i, "bw"] = bw
             resultdf.loc[i, "errRatio"] = 0
-        resultdf.to_csv(file, index=False, na_rep="Null")
+        _write_csv(resultdf, file, index=False, na_rep="Null")
 
     def set_run_iters(self, input, inputdtype):
         if len(input) >= 5:  # gfx-aware key: (gfx, cu_num, m, n, k, ...)

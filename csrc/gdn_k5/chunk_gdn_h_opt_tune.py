@@ -28,7 +28,7 @@ from aiter.ops.flydsl.linear_attention_prefill_kernels import _hipeq_select_bv
 from aiter.ops.flydsl.linear_attention_prefill_kernels import (
     chunk_gated_delta_rule_fwd_h_flydsl_opt as k5,
 )
-from aiter.utility.base_tuner import TunerCommon, _read_csv
+from aiter.utility.base_tuner import TunerCommon, _read_csv, _write_csv
 
 CHUNK_SIZE = 64
 BV_CANDIDATES = (16, 32, 64)
@@ -532,7 +532,7 @@ class K5BvTuner(TunerCommon):
         ordered_cols = [c for c in _CSV_COLUMN_ORDER if c in resultdf.columns]
         ordered_cols.extend(c for c in resultdf.columns if c not in ordered_cols)
         resultdf = resultdf[ordered_cols]
-        resultdf.to_csv(file, index=False)
+        _write_csv(resultdf, file, index=False)
 
     def run_config(self, args):
         tol = _RUN_CONFIG_TOL_PCT

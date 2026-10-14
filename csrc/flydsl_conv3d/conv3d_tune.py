@@ -44,7 +44,7 @@ from aiter.ops.flydsl.conv_kernels import (
     _parse_tuned_bool,
 )
 from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import out_extent
-from aiter.utility.base_tuner import TunerCommon
+from aiter.utility.base_tuner import TunerCommon, _write_csv
 from aiter.utility.mp_tuner import mp_tuner
 
 # The runtime lookup's key columns are the tuning key, and the untuned CSV
@@ -521,7 +521,7 @@ class Conv3dTuner(TunerCommon):
             .sort_values("_rank", kind="stable")
             .drop(columns="_rank")
         )
-        tunedf.to_csv(tune_file, index=False)
+        _write_csv(tunedf, tune_file, index=False)
 
     def result_to_csv(self, resultdf, file, concat=False):
         old_df = self.get_tuned_gemm_list(file)
@@ -533,7 +533,7 @@ class Conv3dTuner(TunerCommon):
             out = self.update_tunedf(old_df, good)
         else:
             out = pd.concat([old_df, good], ignore_index=True)
-        out.to_csv(file, index=False, na_rep="Null")
+        _write_csv(out, file, index=False, na_rep="Null")
 
     def _clear_op_caches(self):
         from aiter.ops.flydsl import conv_kernels

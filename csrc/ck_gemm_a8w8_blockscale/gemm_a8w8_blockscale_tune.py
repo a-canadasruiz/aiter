@@ -29,7 +29,7 @@ from aiter.ops.shuffle import (
     shuffle_weight,
 )
 from aiter.utility import fp4_utils
-from aiter.utility.base_tuner import GemmCommonTuner, _read_csv
+from aiter.utility.base_tuner import GemmCommonTuner, _read_csv, _write_csv
 from aiter.utility.mp_tuner import mp_tuner
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -374,7 +374,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         finally:
             self._hide_bmm = False
         merged = pd.concat([_read_csv(file), bmm_rows], ignore_index=True)
-        merged.to_csv(file, index=False, na_rep="Null")
+        _write_csv(merged, file, index=False, na_rep="Null")
 
     def sortResults(self, tune_file, issorted, values):
         # super() de-duplicates on self.keys, which bmm and mxpsh share entirely,
@@ -395,7 +395,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         )
         if issorted:
             df = df.sort_values(by=values)
-        df.to_csv(tune_file, index=False)
+        _write_csv(df, tune_file, index=False)
 
     def get_untuned_gemm_list(self, untuned_gemm_file):
         # A plain M,N,K shape list has no w_scale_block, but pre_process slices

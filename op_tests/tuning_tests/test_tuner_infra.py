@@ -80,6 +80,124 @@ class TestReadCSV(unittest.TestCase):
             os.unlink(path)
 
 
+def _tuned_row(M, us, name):
+    return {
+        "gfx": TEST_GFX,
+        "cu_num": 304,
+        "M": M,
+        "N": 1024,
+        "K": 512,
+        "kernelId": 0,
+        "splitK": 0,
+        "us": us,
+        "kernelName": name,
+        "tflops": 1.0,
+        "bw": 1.0,
+        "errRatio": 0.0,
+    }
+
+
+def _crash_after_partial_write(self, path_or_buf=None, *args, **kwargs):
+    """Stand-in for DataFrame.to_csv that dies halfway through the file."""
+    text = _REAL_TO_CSV(self, None, *args, **kwargs)
+    if hasattr(path_or_buf, "write"):
+        path_or_buf.write(text[: len(text) // 2])
+        path_or_buf.flush()
+    else:
+        with open(path_or_buf, "w") as f:
+            f.write(text[: len(text) // 2])
+    raise KeyboardInterrupt("killed mid-write")
+
+
+_REAL_TO_CSV = pd.DataFrame.to_csv
+
+
+class TestWriteCSV(unittest.TestCase):
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = self._tmp.name
+        self.path = os.path.join(self.dir, "tuned.csv")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _leftovers(self):
+        return sorted(n for n in os.listdir(self.dir) if n.endswith(".tmp"))
+
+    def test_round_trip(self):
+        from aiter.utility.base_tuner import _read_csv, _write_csv
+
+        df = pd.DataFrame([_tuned_row(1, 10.0, "a"), _tuned_row(2, 20.0, "b")])
+        _write_csv(df, self.path, index=False, na_rep="Null")
+        pd.testing.assert_frame_equal(_read_csv(self.path), df)
+        self.assertEqual(self._leftovers(), [])
+
+    def test_crash_mid_write_keeps_old_file(self):
+        from unittest import mock
+
+        from aiter.utility.base_tuner import _write_csv
+
+        pd.DataFrame([_tuned_row(1, 10.0, "old")]).to_csv(self.path, index=False)
+        with open(self.path) as f:
+            before = f.read()
+        new = pd.DataFrame([_tuned_row(M, 5.0, "new") for M in range(1, 200)])
+        with (
+            mock.patch.object(pd.DataFrame, "to_csv", _crash_after_partial_write),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            _write_csv(new, self.path, index=False)
+        with open(self.path) as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual(self._leftovers(), [])
+
+    def test_keeps_existing_mode(self):
+        from aiter.utility.base_tuner import _write_csv
+
+        pd.DataFrame([_tuned_row(1, 10.0, "old")]).to_csv(self.path, index=False)
+        os.chmod(self.path, 0o664)
+        _write_csv(pd.DataFrame([_tuned_row(1, 5.0, "new")]), self.path, index=False)
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o664)
+
+    def test_new_file_follows_umask(self):
+        from aiter.utility.base_tuner import _write_csv
+
+        old_mask = os.umask(0o022)
+        try:
+            _write_csv(pd.DataFrame([_tuned_row(1, 5.0, "new")]), self.path)
+        finally:
+            os.umask(old_mask)
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o644)
+
+    def test_writes_through_symlink(self):
+        from aiter.utility.base_tuner import _read_csv, _write_csv
+
+        target = os.path.join(self.dir, "real.csv")
+        pd.DataFrame([_tuned_row(1, 10.0, "old")]).to_csv(target, index=False)
+        os.symlink(target, self.path)
+        _write_csv(pd.DataFrame([_tuned_row(1, 5.0, "new")]), self.path, index=False)
+        self.assertTrue(os.path.islink(self.path))
+        self.assertEqual(_read_csv(target).iloc[0]["kernelName"], "new")
+
+    def test_result_to_csv_crash_keeps_tuned_file(self):
+        from unittest import mock
+
+        tuner = _StubTuner.get()
+        pd.DataFrame([_tuned_row(M, 10.0, "old") for M in (1, 2, 3)]).to_csv(
+            self.path, index=False
+        )
+        with open(self.path) as f:
+            before = f.read()
+        results = pd.DataFrame([_tuned_row(4, 5.0, "new")])
+        with (
+            mock.patch.object(pd.DataFrame, "to_csv", _crash_after_partial_write),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            tuner.result_to_csv(results, self.path)
+        with open(self.path) as f:
+            self.assertEqual(f.read(), before)
+
+
 class TestUpdateTunedf(unittest.TestCase):
 
     def test_merges_existing_key(self):

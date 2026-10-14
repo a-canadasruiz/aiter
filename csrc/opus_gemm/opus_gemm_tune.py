@@ -73,7 +73,7 @@ from opus_gemm_common import (
 
 from aiter import dtypes, logger
 from aiter.ops.opus import opus_bmm as _opus_bmm
-from aiter.utility.base_tuner import INVALID_TIME, GemmCommonTuner
+from aiter.utility.base_tuner import INVALID_TIME, GemmCommonTuner, _write_csv
 from aiter.utility.mp_tuner import mp_tuner
 
 # gfx1250 candidate-filter knobs (see _gfx1250_select_candidates).
@@ -1833,7 +1833,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             tflops, bw = self.calculate(info)
             df.loc[i, "tflops"] = tflops
             df.loc[i, "bw"] = bw
-        df.to_csv(file, index=False, na_rep="Null")
+        _write_csv(df, file, index=False, na_rep="Null")
 
     def result_to_csv(self, resultdf, file, concat=False):
         """Replace-if-better gate for --retune.
