@@ -6,12 +6,15 @@ tune() runs for real, but mp_tuner is replaced, so no candidate is built or
 timed. The task tags it would have timed are compared, in order, with
 fmoe_candidate_snapshot.json.
 
-Each arch is collected in its own process: get_gfx() reads GPU_ARCHS once and
-caches it, and the CK kernel lists read it through a second copy of chip_info.
-gemm_moe_tune.py needs torch and aiter to import, so run this on a ROCm node.
+Only the arch of the GPU in the machine is collected. GPU_ARCHS cannot stand
+in for another arch: dtypes.fp8 and many other checks read the real GPU
+through get_gfx_runtime(), so a gfx942 run on gfx950 mixes both. Each arch's
+entry is therefore generated on its own node; the test skips an arch the
+snapshot does not have yet.
 
-After an intended candidate change, regenerate the snapshot and review its diff:
+After an intended candidate change, regenerate on each arch and review the diff:
     python3 op_tests/tuning_tests/test_fmoe_candidate_snapshot.py --regenerate
+--regenerate rewrites only the entry of the current arch.
 """
 
 import contextlib
@@ -50,10 +53,9 @@ KEYS = [
     "doweight_stage1",
 ]
 
-ARCH_ENV = {
-    "gfx950": {"GPU_ARCHS": "gfx950", "CU_NUM": "256"},
-    "gfx942": {"GPU_ARCHS": "gfx942", "CU_NUM": "304"},
-}
+CU_NUM = {"gfx950": 256, "gfx942": 304}
+# Removed from the child so the arch and CU count come from the real GPU.
+_ARCH_ENV = ("GPU_ARCHS", "CU_NUM")
 
 # Unset runs FlyDSL v2 alone when it has candidates; empty runs every backend.
 TUNE_ONLY_MODES = {"default": None, "all": ""}
@@ -81,7 +83,7 @@ def _shape(gfx, token, dims, act, q_type, q_dtype_a, q_dtype_w, doweight=0):
     model_dim, inter_dim, expert, topk = dims
     return (
         gfx,
-        int(ARCH_ENV[gfx]["CU_NUM"]),
+        CU_NUM[gfx],
         token,
         model_dim,
         inter_dim,
@@ -152,11 +154,19 @@ def _tag(task):
     return [_plain(v) for v in rest]
 
 
-def collect(gfx):
-    """Return ordered task tags and per-backend counts for every shape of gfx."""
+def collect():
+    """Return the GPU arch, and ordered task tags and per-backend counts for
+    every shape of that arch."""
     import pandas as pd
 
+    from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
     from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+    gfx = get_gfx_runtime()
+    if gfx not in CU_NUM:
+        raise RuntimeError(f"no snapshot shapes for {gfx}; known: {list(CU_NUM)}")
+    if get_gfx() != gfx:
+        raise RuntimeError(f"get_gfx() is {get_gfx()} but the GPU is {gfx}")
 
     tuner = gemm_moe_tune.FmoeTuner("snapshotFmoe", KEYS, [], "candidate snapshot")
     with mock.patch.object(sys, "argv", ["gemm_moe_tune.py"]):
@@ -217,18 +227,21 @@ def collect(gfx):
             snapshot[f"{_shape_id(shape)} TUNE_ONLY={mode}"] = list(captured)
             if mode == "all":
                 coverage[_shape_id(shape)] = dict(counts)
-    return {"candidates": snapshot, "coverage": coverage}
+    return {"gfx": gfx, "candidates": snapshot, "coverage": coverage}
 
 
-def collect_in_subprocess(gfx):
+def collect_in_subprocess():
     with tempfile.TemporaryDirectory() as tmp:
-        out = os.path.join(tmp, f"{gfx}.json")
+        out = os.path.join(tmp, "collected.json")
         # Exclusions are cached at module import, so clean the child environment
         # before importing the tuner, not only around tune().
-        env = {k: v for k, v in os.environ.items() if k not in _TUNER_ENV}
-        env.update(ARCH_ENV[gfx])
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in _TUNER_ENV and k not in _ARCH_ENV
+        }
         result = subprocess.run(
-            [sys.executable, __file__, "--collect", gfx, out],
+            [sys.executable, __file__, "--collect", out],
             env=env,
             cwd=REPO_ROOT,
             capture_output=True,
@@ -237,15 +250,16 @@ def collect_in_subprocess(gfx):
         )
         if result.returncode != 0:
             raise RuntimeError(
-                f"collecting {gfx} candidates exited {result.returncode}:\n"
+                f"collecting candidates exited {result.returncode}:\n"
                 f"{result.stderr[-4000:]}"
             )
         with open(out) as f:
-            return json.load(f)
+            data = json.load(f)
+    return data.pop("gfx"), data
 
 
 def validate_coverage(snapshot):
-    """Require emitting and empty cases per backend across the arch fixture.
+    """Require emitting and empty cases per backend across every arch in CU_NUM.
 
     An empty case may be rejected by tune() before reaching a generator.
     This is a minimum coverage check, not proof of every internal branch.
@@ -280,10 +294,23 @@ def _diff(expected, actual):
     importlib.util.find_spec("torch") is not None, "gemm_moe_tune.py needs torch"
 )
 class TestFmoeCandidateSnapshot(unittest.TestCase):
-    def _check(self, gfx):
-        baseline = json.loads(SNAPSHOT.read_text())
+    def _baseline(self):
+        if not SNAPSHOT.exists():
+            self.skipTest(f"{SNAPSHOT.name} missing; run --regenerate on each arch")
+        return json.loads(SNAPSHOT.read_text())
+
+    def test_snapshot_covers_every_backend(self):
+        baseline = self._baseline()
+        missing = [gfx for gfx in CU_NUM if gfx not in baseline]
+        if missing:
+            self.skipTest(f"no snapshot entry yet for {missing}")
         validate_coverage(baseline)
-        collected = collect_in_subprocess(gfx)
+
+    def test_candidates_match_snapshot_on_this_gpu(self):
+        baseline = self._baseline()
+        gfx, collected = collect_in_subprocess()
+        if gfx not in baseline:
+            self.skipTest(f"no {gfx} entry; run --regenerate on a {gfx} node")
         self.assertEqual(collected["coverage"], baseline[gfx]["coverage"])
         expected = baseline[gfx]["candidates"]
         actual = collected["candidates"]
@@ -292,31 +319,33 @@ class TestFmoeCandidateSnapshot(unittest.TestCase):
             with self.subTest(shape=key):
                 self.assertEqual(actual[key], tags, _diff(tags, actual[key]))
 
-    def test_gfx950(self):
-        self._check("gfx950")
 
-    def test_gfx942(self):
-        self._check("gfx942")
+def _regenerate():
+    snapshot = json.loads(SNAPSHOT.read_text()) if SNAPSHOT.exists() else {}
+    gfx, data = collect_in_subprocess()
+    snapshot[gfx] = data
+    missing = [arch for arch in CU_NUM if arch not in snapshot]
+    if missing:
+        print(f"backend coverage not checked: no entry yet for {missing}")
+    else:
+        validate_coverage(snapshot)
+    with open(SNAPSHOT, "w") as f:
+        json.dump(
+            {arch: snapshot[arch] for arch in CU_NUM if arch in snapshot}, f, indent=1
+        )
+        f.write("\n")
+    print(gfx, {k: len(v) for k, v in data["candidates"].items()})
+    for backend in BACKENDS:
+        emitting = sum(row[backend] > 0 for row in data["coverage"].values())
+        empty = len(data["coverage"]) - emitting
+        print(f"  {backend}: {emitting} emitting, {empty} empty")
 
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--collect"]:
-        gfx, out = sys.argv[2], sys.argv[3]
-        with open(out, "w") as f:
-            json.dump(collect(gfx), f)
+        with open(sys.argv[2], "w") as f:
+            json.dump(collect(), f)
     elif sys.argv[1:] == ["--regenerate"]:
-        snapshot = {gfx: collect_in_subprocess(gfx) for gfx in ARCH_ENV}
-        validate_coverage(snapshot)
-        with open(SNAPSHOT, "w") as f:
-            json.dump(snapshot, f, indent=1)
-            f.write("\n")
-        for gfx, data in snapshot.items():
-            print(gfx, {k: len(v) for k, v in data["candidates"].items()})
-            for backend in BACKENDS:
-                rows = data["coverage"].values()
-                emitting = sum(row[backend] > 0 for row in rows)
-                print(
-                    f"  {backend}: {emitting} emitting, {len(data['coverage']) - emitting} empty"
-                )
+        _regenerate()
     else:
         unittest.main()
