@@ -3,17 +3,21 @@
 """Snapshot of the candidates FmoeTuner.tune() submits, per shape and arch.
 
 tune() runs for real, but mp_tuner is replaced, so no candidate is built or
-timed. The task tags it would have timed are compared, in order, with
-fmoe_candidate_snapshot.json.
+timed. The task tags it would have timed are compared, in order, with a
+snapshot taken on the base commit.
+
+The snapshot is not committed: it is about 1.3 MB per arch and goes stale
+whenever main changes a candidate. Take it on the base, then run the test on
+the branch, on the same node:
+    git checkout <base>
+    python3 op_tests/tuning_tests/test_fmoe_candidate_snapshot.py --regenerate
+    git checkout <branch>
+    python3 op_tests/tuning_tests/test_fmoe_candidate_snapshot.py -v
+AITER_FMOE_CANDIDATE_SNAPSHOT sets its path; the default is outside the repo.
 
 Only the arch of the GPU in the machine is collected. GPU_ARCHS cannot stand
 in for another arch: dtypes.fp8 and many other checks read the real GPU
-through get_gfx_runtime(), so a gfx942 run on gfx950 mixes both. Each arch's
-entry is therefore generated on its own node; the test skips an arch the
-snapshot does not have yet.
-
-After an intended candidate change, regenerate on each arch and review the diff:
-    python3 op_tests/tuning_tests/test_fmoe_candidate_snapshot.py --regenerate
+through get_gfx_runtime(), so a gfx942 run on gfx950 mixes both.
 --regenerate rewrites only the entry of the current arch.
 """
 
@@ -33,7 +37,12 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-SNAPSHOT = Path(__file__).with_name("fmoe_candidate_snapshot.json")
+SNAPSHOT = Path(
+    os.environ.get(
+        "AITER_FMOE_CANDIDATE_SNAPSHOT",
+        Path(tempfile.gettempdir()) / "aiter_fmoe_candidate_snapshot.json",
+    )
+)
 
 # Same order as the key list in gemm_moe_tune.py's __main__.
 KEYS = [
@@ -258,8 +267,8 @@ def collect_in_subprocess():
     return data.pop("gfx"), data
 
 
-def validate_coverage(snapshot):
-    """Require emitting and empty cases per backend across every arch in CU_NUM.
+def coverage_gaps(snapshot):
+    """Backends without an emitting or an empty case across the snapshot's archs.
 
     An empty case may be rejected by tune() before reaching a generator.
     This is a minimum coverage check, not proof of every internal branch.
@@ -267,14 +276,13 @@ def validate_coverage(snapshot):
     rows = [
         counts for arch in snapshot.values() for counts in arch["coverage"].values()
     ]
-    missing = []
+    gaps = []
     for backend in BACKENDS:
         if not any(row[backend] > 0 for row in rows):
-            missing.append(f"{backend}: no case emits candidates")
+            gaps.append(f"{backend}: no case emits candidates")
         if not any(row[backend] == 0 for row in rows):
-            missing.append(f"{backend}: no empty case")
-    if missing:
-        raise AssertionError("Incomplete backend coverage:\n" + "\n".join(missing))
+            gaps.append(f"{backend}: no empty case")
+    return gaps
 
 
 def _diff(expected, actual):
@@ -296,15 +304,16 @@ def _diff(expected, actual):
 class TestFmoeCandidateSnapshot(unittest.TestCase):
     def _baseline(self):
         if not SNAPSHOT.exists():
-            self.skipTest(f"{SNAPSHOT.name} missing; run --regenerate on each arch")
+            self.skipTest(f"{SNAPSHOT} missing; run --regenerate on the base commit")
         return json.loads(SNAPSHOT.read_text())
 
     def test_snapshot_covers_every_backend(self):
         baseline = self._baseline()
-        missing = [gfx for gfx in CU_NUM if gfx not in baseline]
-        if missing:
-            self.skipTest(f"no snapshot entry yet for {missing}")
-        validate_coverage(baseline)
+        # Every backend has gfx950 kernels; gfx942 alone lacks the per_1x32 ones.
+        if "gfx950" not in baseline:
+            self.skipTest("backend coverage needs the gfx950 entry")
+        gaps = coverage_gaps(baseline)
+        self.assertFalse(gaps, "Incomplete backend coverage:\n" + "\n".join(gaps))
 
     def test_candidates_match_snapshot_on_this_gpu(self):
         baseline = self._baseline()
@@ -324,16 +333,15 @@ def _regenerate():
     snapshot = json.loads(SNAPSHOT.read_text()) if SNAPSHOT.exists() else {}
     gfx, data = collect_in_subprocess()
     snapshot[gfx] = data
-    missing = [arch for arch in CU_NUM if arch not in snapshot]
-    if missing:
-        print(f"backend coverage not checked: no entry yet for {missing}")
-    else:
-        validate_coverage(snapshot)
+    for gap in coverage_gaps(snapshot):
+        print(f"coverage gap: {gap}")
+    SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
     with open(SNAPSHOT, "w") as f:
         json.dump(
             {arch: snapshot[arch] for arch in CU_NUM if arch in snapshot}, f, indent=1
         )
         f.write("\n")
+    print(f"wrote {SNAPSHOT}")
     print(gfx, {k: len(v) for k, v in data["candidates"].items()})
     for backend in BACKENDS:
         emitting = sum(row[backend] > 0 for row in data["coverage"].values())
