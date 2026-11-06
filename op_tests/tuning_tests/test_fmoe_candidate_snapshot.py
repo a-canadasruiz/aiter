@@ -7,18 +7,24 @@ timed. The task tags it would have timed are compared, in order, with a
 snapshot taken on the base commit.
 
 The snapshot is not committed: it is about 1.3 MB per arch and goes stale
-whenever main changes a candidate. Take it on the base, then run the test on
-the branch, on the same node:
+whenever main changes a candidate. AITER_FMOE_CANDIDATE_SNAPSHOT names its
+path, with no default. Take it on the base commit, then run the test on the
+branch, on the same node:
+    export AITER_FMOE_CANDIDATE_SNAPSHOT=<dir>/fmoe_snapshot_<base>.json
     git checkout <base>
     python3 op_tests/tuning_tests/test_fmoe_candidate_snapshot.py --regenerate
     git checkout <branch>
     python3 op_tests/tuning_tests/test_fmoe_candidate_snapshot.py -v
-AITER_FMOE_CANDIDATE_SNAPSHOT sets its path; the default is outside the repo.
+
+The snapshot records the commit it was taken at. --regenerate refuses to run
+with uncommitted changes under aiter/ or csrc/, and to replace an arch entry
+or a snapshot of another commit unless given --force. The test fails when the
+snapshot's commit is not an ancestor of HEAD.
 
 Only the arch of the GPU in the machine is collected. GPU_ARCHS cannot stand
 in for another arch: dtypes.fp8 and many other checks read the real GPU
-through get_gfx_runtime(), so a gfx942 run on gfx950 mixes both.
---regenerate rewrites only the entry of the current arch.
+through get_gfx_runtime(), so a gfx942 run on gfx950 mixes both. The second
+arch is added to the same file on its own node, at the same commit.
 """
 
 import contextlib
@@ -37,12 +43,30 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-SNAPSHOT = Path(
-    os.environ.get(
-        "AITER_FMOE_CANDIDATE_SNAPSHOT",
-        Path(tempfile.gettempdir()) / "aiter_fmoe_candidate_snapshot.json",
+SNAPSHOT_ENV = "AITER_FMOE_CANDIDATE_SNAPSHOT"
+_SOURCE_DIRS = ("aiter", "csrc")
+
+
+def snapshot_path():
+    value = os.environ.get(SNAPSHOT_ENV)
+    return Path(value) if value else None
+
+
+def _git(*args):
+    return subprocess.run(
+        ["git", *args], cwd=REPO_ROOT, capture_output=True, text=True, check=False
     )
-)
+
+
+def head_commit():
+    return _git("rev-parse", "HEAD").stdout.strip()
+
+
+def source_changes():
+    """Tracked changes under aiter/ and csrc/; JIT build outputs are untracked."""
+    status = _git("status", "--porcelain", "--untracked-files=no", "--", *_SOURCE_DIRS)
+    return status.stdout.strip()
+
 
 # Same order as the key list in gemm_moe_tune.py's __main__.
 KEYS = [
@@ -303,9 +327,21 @@ def _diff(expected, actual):
 )
 class TestFmoeCandidateSnapshot(unittest.TestCase):
     def _baseline(self):
-        if not SNAPSHOT.exists():
-            self.skipTest(f"{SNAPSHOT} missing; run --regenerate on the base commit")
-        return json.loads(SNAPSHOT.read_text())
+        path = snapshot_path()
+        if path is None:
+            self.skipTest(f"{SNAPSHOT_ENV} not set")
+        if not path.exists():
+            self.skipTest(f"{path} missing; run --regenerate on the base commit")
+        snapshot = json.loads(path.read_text())
+        self.assertIn("base", snapshot, f"{path} records no base commit")
+        base, head = snapshot["base"], head_commit()
+        sys.stderr.write(f"\n{path}: taken at {base}, HEAD is {head}\n")
+        self.assertEqual(
+            _git("merge-base", "--is-ancestor", base, head).returncode,
+            0,
+            f"snapshot commit {base} is not an ancestor of HEAD {head}",
+        )
+        return snapshot["archs"]
 
     def test_snapshot_covers_every_backend(self):
         baseline = self._baseline()
@@ -329,19 +365,38 @@ class TestFmoeCandidateSnapshot(unittest.TestCase):
                 self.assertEqual(actual[key], tags, _diff(tags, actual[key]))
 
 
-def _regenerate():
-    snapshot = json.loads(SNAPSHOT.read_text()) if SNAPSHOT.exists() else {}
+def _regenerate(force):
+    path = snapshot_path()
+    if path is None:
+        sys.exit(f"set {SNAPSHOT_ENV} to the snapshot path")
+    changes = source_changes()
+    if changes:
+        sys.exit(f"uncommitted changes under aiter/ or csrc/:\n{changes}")
+    base = head_commit()
+    snapshot = {"base": base, "archs": {}}
+    if path.exists():
+        old = json.loads(path.read_text())
+        if old.get("base") == base:
+            snapshot = old
+        elif not force:
+            sys.exit(
+                f"{path} was taken at {old.get('base')}, HEAD is {base}; "
+                "use a new path, or --force to replace it"
+            )
     gfx, data = collect_in_subprocess()
-    snapshot[gfx] = data
-    for gap in coverage_gaps(snapshot):
+    if gfx in snapshot["archs"] and not force:
+        sys.exit(f"{path} already has {gfx} at {base}; --force replaces it")
+    snapshot["archs"][gfx] = data
+    for gap in coverage_gaps(snapshot["archs"]):
         print(f"coverage gap: {gap}")
-    SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
-    with open(SNAPSHOT, "w") as f:
-        json.dump(
-            {arch: snapshot[arch] for arch in CU_NUM if arch in snapshot}, f, indent=1
-        )
+    snapshot["archs"] = {
+        a: snapshot["archs"][a] for a in CU_NUM if a in snapshot["archs"]
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(snapshot, f, indent=1)
         f.write("\n")
-    print(f"wrote {SNAPSHOT}")
+    print(f"wrote {gfx} at {base} to {path}")
     print(gfx, {k: len(v) for k, v in data["candidates"].items()})
     for backend in BACKENDS:
         emitting = sum(row[backend] > 0 for row in data["coverage"].values())
@@ -353,7 +408,7 @@ if __name__ == "__main__":
     if sys.argv[1:2] == ["--collect"]:
         with open(sys.argv[2], "w") as f:
             json.dump(collect(), f)
-    elif sys.argv[1:] == ["--regenerate"]:
-        _regenerate()
+    elif sys.argv[1:2] == ["--regenerate"] and sys.argv[2:] in ([], ["--force"]):
+        _regenerate(force=sys.argv[2:] == ["--force"])
     else:
         unittest.main()
