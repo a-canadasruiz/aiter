@@ -11,6 +11,9 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_compare_logic.py` | 1 | No | Compare/update_improved: `_build_compare_update_plan`, `_merge_compare_filtered_results` |
 | `test_mp_tuner_logic.py` | 1 | No | `mp_tuner` polling: timeout, AcceleratorError, KeyError, pool restart |
 | `test_online_tune.py` | 1 | No | `AITER_ONLINE_TUNE` decision logic, `mp_lock` synchronization, MainFunc CSV write, cfg_2stages reload |
+| `test_fmoe_winner_replay.py` | 1 | No | `FmoeTuner.post_process` winner on hand-made results: filters, stage pairing, ties, power ranking, fairness costs, FLAT head-to-head (timing replaced) |
+| `test_fmoe_tune_dispatch.py` | 1 | No | `FmoeTuner.tune()` generator dispatch, opus/FlyDSL shape filters, grouped and MXFP4 candidate selection, `result_to_csv` |
+| `test_fmoe_candidate_snapshot.py` | 1 | No | Candidates `FmoeTuner.tune()` submits against a snapshot taken on the base commit (`AITER_FMOE_CANDIDATE_SNAPSHOT`); skipped without it |
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |
 | `test_asm_splitk_guard.py` | 1 | No | `GemmTuner.asm_gemm_all_solutions` SplitK semaphore grid guard |
 | `test_run_config.py` | 2 | Yes | Run --run_config on ALL existing tuned CSVs (configs + model_configs) |
@@ -19,7 +22,8 @@ Minimal test suite for validating the aiter tuning infrastructure.
 
 Fast deterministic tuning validation is part of the normal pull-request test
 sharding through `.github/scripts/split_tests.sh`. That gate includes CSV
-validation, shape-collision checks, and the mixed-MXFP tuner unit tests.
+validation, shape-collision checks, the mixed-MXFP tuner unit tests, the
+fused-MoE winner replay, and the fused-MoE tune-dispatch locks.
 
 The full Level 0+1 workflow repeats the broader CPU suite on its daily/manual
 schedule. GPU tuner-pipeline and all-shape `--run_config` validation remain
@@ -65,6 +69,8 @@ python3 -m unittest op_tests.tuning_tests.test_csv_validation \
   op_tests.tuning_tests.test_tuner_infra \
   op_tests.tuning_tests.test_mp_tuner_logic \
   op_tests.tuning_tests.test_mixed_mxfp_tuning \
+  op_tests.tuning_tests.test_fmoe_winner_replay \
+  op_tests.tuning_tests.test_fmoe_tune_dispatch \
   op_tests.tuning_tests.test_online_tune -v
 python3 -m pytest op_tests/tuning_tests/test_fhmoe_tuner.py -v
 
