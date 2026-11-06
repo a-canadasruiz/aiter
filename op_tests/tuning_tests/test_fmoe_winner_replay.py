@@ -139,7 +139,8 @@ class TestFmoeWinnerReplay(unittest.TestCase):
         )
         with mock.patch.object(sys, "argv", ["gemm_moe_tune.py"]):
             self.args = self.tuner.parse_args()
-        self.assertEqual(self.args.errRatio, 0.05)
+        # FmoeTuner's own default, not TunerCommon's 0.05.
+        self.assertEqual(self.args.errRatio, 0.1)
 
     def cand(self, stage, kernel, us, err=0.0, bm=32, v2=0, nt=0, shape=None):
         """One mp_tuner result; the tag matches the generators' layout."""
@@ -183,16 +184,16 @@ class TestFmoeWinnerReplay(unittest.TestCase):
 
     def test_a_invalid_times_and_errors_are_dropped(self):
         results = [
-            self.cand("stage1", "s1_err_high", 0.5, err=0.06),
+            self.cand("stage1", "s1_err_high", 0.5, err=0.11),
             self.cand("stage1", "s1_minus1", -1),
             self.cand("stage1", "s1_neg_inf", float("-inf")),
             self.cand("stage1", "s1_inf", float("inf")),
-            self.cand("stage1", "s1_at_err_ratio", 2.0, err=0.05),
+            self.cand("stage1", "s1_at_err_ratio", 2.0, err=0.1),
             self.cand("stage1", "s1_slow", 3.0),
             self.cand("stage2", "s2", 1.0),
         ]
         self.assertWinner(
-            results, two_stage(2.0, 1.0, kernel1="s1_at_err_ratio", err1="5.0%")
+            results, two_stage(2.0, 1.0, kernel1="s1_at_err_ratio", err1="10.0%")
         )
 
     def test_b_pairs_share_block_m(self):
