@@ -163,6 +163,8 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         q_dtype_a=None,
         q_dtype_w=None,
         q_type=None,
+        act_type=None,
+        doweight_stage1=0,
     ):
         m = self.gemm_moe_tune
         return (
@@ -173,13 +175,13 @@ class TestFmoeTuneDispatch(unittest.TestCase):
             inter_dim,
             8,
             2,
-            m.ActivationType.Silu,
+            m.ActivationType.Silu if act_type is None else act_type,
             m.torch.bfloat16,
             m.dtypes.fp8 if q_dtype_a is None else q_dtype_a,
             m.dtypes.fp4x2 if q_dtype_w is None else q_dtype_w,
             m.QuantType.per_1x32 if q_type is None else q_type,
             1,
-            0,
+            doweight_stage1,
         )
 
     def test_per_1x32_off_gfx950_returns_no_tasks(self):
@@ -284,6 +286,48 @@ class TestFmoeTuneDispatch(unittest.TestCase):
                 model_dim=5120, logical_inter_dim=1152, inter_dim_pad=0
             )
         )
+
+    def test_opus_stage1_gates_leave_stage2_in_place(self):
+        # stage1_supported only guards the stage1 loop. An unsupported
+        # activation or doweight_stage1 drops stage1 and keeps every stage2.
+        m = self.gemm_moe_tune
+
+        def by_stage(tasks):
+            return {
+                stage: sorted(t[0][2:4] for t in tasks if t[0][1] == stage)
+                for stage in ("stage1", "stage2")
+            }
+
+        base = by_stage(self.tuner.gen_opus_2stages_task(self.info(), BLOCK_MS))
+        self.assertTrue(base["stage1"])
+        self.assertTrue(base["stage2"])
+        cases = {
+            "Gelu": self.info(act_type=m.ActivationType.Gelu),
+            "doweight_stage1": self.info(doweight_stage1=1),
+        }
+        for name, info in cases.items():
+            with self.subTest(name):
+                got = by_stage(self.tuner.gen_opus_2stages_task(info, BLOCK_MS))
+                self.assertEqual(got["stage1"], [])
+                self.assertEqual(got["stage2"], base["stage2"])
+
+    def test_opus_stage2_drops_a_block_n_that_misses_model_dim(self):
+        # 5248 = 41 * 128: a multiple of block_n 64 and 128, not of 256.
+        m = self.gemm_moe_tune
+        catalog = m.get_opus_a8w4_stage2_kernels(token=1)
+        by_block_n = {}
+        for name, kparams in catalog.items():
+            by_block_n.setdefault(int(kparams["kernel_block_n"]), set()).add(name)
+        self.assertEqual(set(by_block_n), {64, 128, 256})
+
+        def stage2(model_dim):
+            tasks = self.tuner.gen_opus_2stages_task(
+                self.info(model_dim=model_dim), BLOCK_MS
+            )
+            return {t[0][2] for t in tasks if t[0][1] == "stage2" and len(t[0]) == 4}
+
+        self.assertEqual(stage2(5120), set(catalog))
+        self.assertEqual(stage2(5248), by_block_n[64] | by_block_n[128])
 
     def test_opus_stage2_kernels_depend_on_token(self):
         small = self.tuner.gen_opus_2stages_task(self.info(token=1), BLOCK_MS)
