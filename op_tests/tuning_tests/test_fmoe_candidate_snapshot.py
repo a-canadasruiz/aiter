@@ -19,7 +19,9 @@ branch, on the same node:
 The snapshot records the commit it was taken at. --regenerate refuses to run
 with uncommitted changes under aiter/ or csrc/, and to replace an arch entry
 or a snapshot of another commit unless given --force. The test fails when the
-snapshot's commit is not an ancestor of HEAD.
+snapshot's commit is not an ancestor of HEAD, and when gemm_moe_tune.py at
+that commit is not the base blob. Regenerating the snapshot after that file
+changes does not make the test pass.
 
 Only the arch of the GPU in the machine is collected. GPU_ARCHS cannot stand
 in for another arch: dtypes.fp8 and many other checks read the real GPU
@@ -45,6 +47,11 @@ sys.path.insert(0, str(REPO_ROOT))
 
 SNAPSHOT_ENV = "AITER_FMOE_CANDIDATE_SNAPSHOT"
 _SOURCE_DIRS = ("aiter", "csrc")
+# Blob of gemm_moe_tune.py at fe86c6e071dcc5c8e306813017679bf31ad59d22.
+# Update this only when a behavior change in that file is accepted and the
+# snapshot is taken again at the new commit.
+_TUNER_PATH = "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py"
+_BASE_TUNER_BLOB = "dece40f21f18590860a5d9156c1db037af73ea69"
 
 
 def snapshot_path():
@@ -340,6 +347,19 @@ class TestFmoeCandidateSnapshot(unittest.TestCase):
             _git("merge-base", "--is-ancestor", base, head).returncode,
             0,
             f"snapshot commit {base} is not an ancestor of HEAD {head}",
+        )
+        blob = _git("rev-parse", f"{base}:{_TUNER_PATH}")
+        self.assertEqual(
+            blob.returncode,
+            0,
+            f"snapshot commit {base} has no {_TUNER_PATH}; retake the snapshot "
+            "on the base commit",
+        )
+        self.assertEqual(
+            blob.stdout.strip(),
+            _BASE_TUNER_BLOB,
+            "snapshot was taken after gemm_moe_tune.py changed; retake it on "
+            f"the base commit (blob {_BASE_TUNER_BLOB})",
         )
         return snapshot["archs"]
 
