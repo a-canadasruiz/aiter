@@ -151,17 +151,19 @@ class TestFmoeWinnerReplay(unittest.TestCase):
         tag = (shape or self.shape, stage, kernel, bm, 0, v2, nt)
         return (tag, us, err)
 
-    def asm(self, kernel, us, err=0.0, bm=32, shape=None, stage="asm_1stage"):
-        return ((shape or self.shape, stage, kernel, bm, 0), us, err)
+    def asm(self, kernel, us, err=0.0, bm=32, shape=None, stage="asm_1stage", flat=0):
+        return ((shape or self.shape, stage, kernel, bm, flat), us, err)
 
     def replay(self, results, timed_us=5.0):
+        """timed_us: the time of every timed function, or a function of it."""
         self.timed = []
 
         def fake_perftest(func, *_args, **_kwargs):
             self.timed.append(func)
-            return None, timed_us
+            return None, timed_us(func) if callable(timed_us) else timed_us
 
-        torch = self.gemm_moe_tune.torch
+        m = self.gemm_moe_tune
+        torch = m.torch
         with tempfile.TemporaryDirectory() as root:
             configs = Path(root, "aiter", "configs")
             configs.mkdir(parents=True)
@@ -177,6 +179,13 @@ class TestFmoeWinnerReplay(unittest.TestCase):
                 mock.patch.object(torch, "randn"),
                 mock.patch.object(torch, "arange"),
                 mock.patch.object(torch, "tensor"),
+                mock.patch.object(torch, "randint"),
+                mock.patch.object(torch, "rand"),
+                # The FLAT head-to-head unpacks 19 inputs; its sequences only
+                # reach fake_perftest, so the values are never used.
+                mock.patch.object(
+                    m.FmoeTuner, "generate_data_1stage", return_value=(None,) * 19
+                ),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 out = self.tuner.post_process(list(results), self.args)
@@ -201,8 +210,8 @@ class TestFmoeWinnerReplay(unittest.TestCase):
             actual[col] = value
         self.assertEqual(actual, expected)
 
-    def assertWinner(self, results, expected, timed=()):
-        out = self.replay(results)
+    def assertWinner(self, results, expected, timed=(), timed_us=5.0):
+        out = self.replay(results, timed_us)
         self.assertEqual(len(out), 1)
         self.assertRow(out.iloc[0], expected)
         self.assertTimed(timed)
@@ -371,6 +380,57 @@ class TestFmoeWinnerReplay(unittest.TestCase):
             two_stage(4.0, 0, kernel1="asm_xbf16", kernel2=None, run_1stage=1, xbf16=1),
             timed=[per_group_quant_hip],
         )
+
+    def flat_race(self, shape):
+        no_sort = self.gemm_moe_tune.AsmMoeMode.NO_SORT.value
+        return [
+            self.asm("asm_flat", 3.0, shape=shape, flat=no_sort),
+            self.asm("asm_sorted", 1.0, shape=shape),
+        ]
+
+    def test_g_sorted_kernels_pay_moe_sorting(self):
+        from aiter.fused_moe import moe_sorting
+
+        no_sort = self.gemm_moe_tune.AsmMoeMode.NO_SORT.value
+        # The sorted kernel pays the 5 us sort: FLAT 3 beats 1 + 5. The
+        # head-to-head only runs for per_1x128, so nothing else is timed.
+        self.assertWinner(
+            self.flat_race(self.shape),
+            two_stage(
+                3.0, 0, kernel1="asm_flat", kernel2=None, run_1stage=1, flat=no_sort
+            ),
+            timed=[moe_sorting],
+        )
+
+    def test_g_flat_head_to_head_on_per_1x128(self):
+        from aiter.fused_moe import moe_sorting
+
+        m = self.gemm_moe_tune
+        fp8 = m.dtypes.fp8
+        no_sort = m.AsmMoeMode.NO_SORT.value
+        shape = self.make_shape(32, fp8, fp8, m.QuantType.per_1x128)
+        timed = [moe_sorting, "_flat_seq", "_nf_seq"]
+
+        def e2e(flat_us, sorted_us):
+            times = {"_flat_seq": flat_us, "_nf_seq": sorted_us}
+            return lambda func: times.get(func.__name__, 5.0)
+
+        with self.subTest("non-FLAT faster by more than 0.5 us: FLAT dropped"):
+            self.assertWinner(
+                self.flat_race(shape),
+                two_stage(6.0, 0, kernel1="asm_sorted", kernel2=None, run_1stage=1),
+                timed,
+                timed_us=e2e(10.0, 8.0),
+            )
+        with self.subTest("within 0.5 us: FLAT kept"):
+            self.assertWinner(
+                self.flat_race(shape),
+                two_stage(
+                    3.0, 0, kernel1="asm_flat", kernel2=None, run_1stage=1, flat=no_sort
+                ),
+                timed,
+                timed_us=e2e(10.0, 9.8),
+            )
 
     def test_two_shapes_get_one_winner_each(self):
         other = self.other_shape
