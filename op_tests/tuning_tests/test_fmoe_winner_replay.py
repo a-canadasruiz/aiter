@@ -6,11 +6,14 @@ Each case feeds post_process hand-made (info, us, err) results, shaped like
 the ones mp_tuner returns, and checks the full winning row: kernels, block_m,
 ksplit, run_1stage, flat, nt, xbf16, times and errors.
 
-The cases avoid the branches that time extra work on the GPU (per_1x32
-quant/cast, per_1x128 xbf16 quant, moe_sorting for FLAT rows and the FLAT
-head-to-head), so post_process launches nothing. gemm_moe_tune.py still
-needs torch and aiter to import. profile_fmoe.csv, which post_process always
-appends to, is written under a temporary AITER_ROOT_DIR.
+post_process times some extra work on the GPU to keep comparisons fair:
+the fp4 quant + sort or fp8 cast between stages (per_1x32), the per_1x128
+quant that xbf16 kernels fuse, and moe_sorting for FLAT rows. The replay
+replaces run_perftest and the tensors built for it, records which function
+would have been timed, and returns a fixed time, so post_process launches
+nothing. gemm_moe_tune.py still needs torch and aiter to import.
+profile_fmoe.csv, which post_process always appends to, is written under a
+temporary AITER_ROOT_DIR.
 """
 
 import contextlib
@@ -113,8 +116,9 @@ class TestFmoeWinnerReplay(unittest.TestCase):
         cls.other_shape = cls.make_shape(token=64)
 
     @classmethod
-    def make_shape(cls, token):
+    def make_shape(cls, token, q_dtype_a=None, q_dtype_w=None, q_type=None):
         m = cls.gemm_moe_tune
+        bf16 = m.torch.bfloat16
         return (
             "gfx950",
             256,
@@ -124,10 +128,10 @@ class TestFmoeWinnerReplay(unittest.TestCase):
             8,
             2,
             m.ActivationType.Silu,
-            m.torch.bfloat16,
-            m.torch.bfloat16,
-            m.torch.bfloat16,
-            m.QuantType.No,
+            bf16,
+            q_dtype_a or bf16,
+            q_dtype_w or bf16,
+            q_type or m.QuantType.No,
             1,
             0,
         )
@@ -147,10 +151,17 @@ class TestFmoeWinnerReplay(unittest.TestCase):
         tag = (shape or self.shape, stage, kernel, bm, 0, v2, nt)
         return (tag, us, err)
 
-    def asm(self, kernel, us, err=0.0, bm=32, shape=None):
-        return ((shape or self.shape, "asm_1stage", kernel, bm, 0), us, err)
+    def asm(self, kernel, us, err=0.0, bm=32, shape=None, stage="asm_1stage"):
+        return ((shape or self.shape, stage, kernel, bm, 0), us, err)
 
-    def replay(self, results):
+    def replay(self, results, timed_us=5.0):
+        self.timed = []
+
+        def fake_perftest(func, *_args, **_kwargs):
+            self.timed.append(func)
+            return None, timed_us
+
+        torch = self.gemm_moe_tune.torch
         with tempfile.TemporaryDirectory() as root:
             configs = Path(root, "aiter", "configs")
             configs.mkdir(parents=True)
@@ -162,11 +173,24 @@ class TestFmoeWinnerReplay(unittest.TestCase):
             with (
                 mock.patch.object(self.gemm_moe_tune, "AITER_ROOT_DIR", root),
                 mock.patch.dict(os.environ, env, clear=True),
+                mock.patch("aiter.test_common.run_perftest", fake_perftest),
+                mock.patch.object(torch, "randn"),
+                mock.patch.object(torch, "arange"),
+                mock.patch.object(torch, "tensor"),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 out = self.tuner.post_process(list(results), self.args)
             self.assertTrue((configs / "profile_fmoe.csv").exists())
         return out
+
+    def assertTimed(self, expected):
+        """expected: the functions timed, in order; a str matches __name__."""
+        self.assertEqual(len(self.timed), len(expected), self.timed)
+        for func, want in zip(self.timed, expected):
+            if isinstance(want, str):
+                self.assertEqual(func.__name__, want)
+            else:
+                self.assertIs(func, want)
 
     def assertRow(self, row, expected):
         actual = {}
@@ -177,10 +201,11 @@ class TestFmoeWinnerReplay(unittest.TestCase):
             actual[col] = value
         self.assertEqual(actual, expected)
 
-    def assertWinner(self, results, expected):
+    def assertWinner(self, results, expected, timed=()):
         out = self.replay(results)
         self.assertEqual(len(out), 1)
         self.assertRow(out.iloc[0], expected)
+        self.assertTimed(timed)
 
     def test_a_invalid_times_and_errors_are_dropped(self):
         results = [
@@ -292,6 +317,61 @@ class TestFmoeWinnerReplay(unittest.TestCase):
         ]
         self.assertWinner(results, two_stage(1.0, 3.0, kernel1=fly1, kernel2=fly2))
 
+    def test_f_fp4_activation_charges_quant_sort_to_unfused_stage1(self):
+        from aiter.ops.quant import fused_dynamic_mxfp4_quant_moe_sort
+
+        m = self.gemm_moe_tune
+        fp4 = m.dtypes.fp4x2
+        shape = self.make_shape(32, fp4, fp4, m.QuantType.per_1x32)
+        timed = [fused_dynamic_mxfp4_quant_moe_sort]
+        with self.subTest("the _fp4 stage1 fuses it: 4 + 1 beats 1 + 5 + 1"):
+            results = [
+                self.cand("stage1", "s1", 1.0, shape=shape),
+                self.cand("stage1", "s1_fp4", 4.0, shape=shape),
+                self.cand("stage2", "s2", 1.0, shape=shape),
+            ]
+            self.assertWinner(results, two_stage(4.0, 1.0, kernel1="s1_fp4"), timed)
+        with self.subTest("a v2 pair fuses it too: 2 + 1 beats 1 + 5 + 1"):
+            results = [
+                self.cand("stage1", "s1", 1.0, shape=shape),
+                self.cand("stage1", "s1_v2", 2.0, v2=1, shape=shape),
+                self.cand("stage2", "s2", 1.0, shape=shape),
+                self.cand("stage2", "s2_v2", 1.0, v2=1, shape=shape),
+            ]
+            self.assertWinner(
+                results, two_stage(2.0, 1.0, kernel1="s1_v2", kernel2="s2_v2"), timed
+            )
+
+    def test_f_fp8_activation_charges_cast_to_unfused_stage1(self):
+        m = self.gemm_moe_tune
+        shape = self.make_shape(32, m.dtypes.fp8, m.dtypes.fp4x2, m.QuantType.per_1x32)
+        # The _fp8 stage1 fuses the cast: 4 + 1 beats 1 + 5 + 1.
+        results = [
+            self.cand("stage1", "s1", 1.0, shape=shape),
+            self.cand("stage1", "s1_fp8", 4.0, shape=shape),
+            self.cand("stage2", "s2", 1.0, shape=shape),
+        ]
+        self.assertWinner(
+            results, two_stage(4.0, 1.0, kernel1="s1_fp8"), timed=["_act_to_fp8"]
+        )
+
+    def test_f_per_1x128_charges_quant_to_non_xbf16_kernels(self):
+        from aiter.ops.quant import per_group_quant_hip
+
+        m = self.gemm_moe_tune
+        fp8 = m.dtypes.fp8
+        shape = self.make_shape(32, fp8, fp8, m.QuantType.per_1x128)
+        # The xbf16 kernel quantizes its own input: 4 beats 1 + 5.
+        results = [
+            self.asm("asm_plain", 1.0, shape=shape),
+            self.asm("asm_xbf16", 4.0, shape=shape, stage="asm_1stage_xbf16"),
+        ]
+        self.assertWinner(
+            results,
+            two_stage(4.0, 0, kernel1="asm_xbf16", kernel2=None, run_1stage=1, xbf16=1),
+            timed=[per_group_quant_hip],
+        )
+
     def test_two_shapes_get_one_winner_each(self):
         other = self.other_shape
         results = [
@@ -306,6 +386,7 @@ class TestFmoeWinnerReplay(unittest.TestCase):
         self.assertEqual([int(t) for t in out["token"]], [32, 64])
         self.assertRow(out.iloc[0], two_stage(1.0, 1.0, "a_s1", "a_s2"))
         self.assertRow(out.iloc[1], two_stage(3.0, 3.0, "b_s1", "b_s2"))
+        self.assertTimed([])
 
     def test_h_no_valid_candidate_records_a_failure(self):
         results = [
@@ -313,6 +394,7 @@ class TestFmoeWinnerReplay(unittest.TestCase):
             self.cand("stage2", "s2", -1),
         ]
         out = self.replay(results)
+        self.assertTimed([])
         self.assertEqual(len(out), 0)
         self.assertEqual(len(self.tuner.failed), 1)
         failed = self.tuner.failed.iloc[0]
