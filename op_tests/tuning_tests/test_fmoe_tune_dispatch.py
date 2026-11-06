@@ -277,7 +277,7 @@ class TestFmoeTuneDispatch(unittest.TestCase):
             m.opus_a8w4_stage1_instances_for_shape(
                 model_dim=5120, logical_inter_dim=1168, inter_dim_pad=0
             ),
-            [],
+            (),
         )
         self.assertTrue(
             m.opus_a8w4_stage1_instances_for_shape(

@@ -591,7 +591,14 @@ class TestFmoeWinnerReplay(unittest.TestCase):
         ]
         self.assertWinner(
             results,
-            two_stage(3.0, 0, kernel1="asm_sorted_bm16", kernel2=None, run_1stage=1),
+            two_stage(
+                3.0,
+                0,
+                kernel1="asm_sorted_bm16",
+                kernel2=None,
+                run_1stage=1,
+                block_m=16,
+            ),
             timed=[moe_sorting] * 2,
             timed_us=lambda func, args, kwargs: cost[_block_m_arg(args, kwargs)],
         )
