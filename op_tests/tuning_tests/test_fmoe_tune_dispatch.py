@@ -166,10 +166,11 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         act_type=None,
         doweight_stage1=0,
         dtype=None,
+        gfx="gfx950",
     ):
         m = self.gemm_moe_tune
         return (
-            "gfx950",
+            gfx,
             256,
             token,
             model_dim,
@@ -390,6 +391,66 @@ class TestFmoeTuneDispatch(unittest.TestCase):
             if name in emitted or f"{name}_fp4" in emitted or f"{name}_fp8" in emitted
         ]
         self.assertEqual(leaked, [])
+
+    def a16w16(self, **overrides):
+        m = self.gemm_moe_tune
+        bf16 = m.dtypes.bf16
+        return self.info(
+            q_dtype_a=bf16, q_dtype_w=bf16, q_type=m.QuantType.No, **overrides
+        )
+
+    def a16w4(self, **overrides):
+        m = self.gemm_moe_tune
+        return self.info(
+            model_dim=3072,
+            q_dtype_a=m.dtypes.bf16,
+            q_dtype_w=m.dtypes.fp4x2,
+            **overrides,
+        )
+
+    def flydsl_stage2_params(self, info):
+        tasks = self.tuner.gen_flydsl_2stages_task(info, BLOCK_MS)
+        # Stage2 run args are (keys, dtype, topk, kparams, blockM, ...).
+        return [t[4][3] for t in tasks if t[0][1] == "stage2"]
+
+    def test_flydsl_a16w16_gate(self):
+        m = self.gemm_moe_tune
+        gen = self.tuner.gen_flydsl_2stages_task
+        self.assertTrue(gen(self.a16w16(), BLOCK_MS))
+        cases = {
+            "Gelu": self.a16w16(act_type=m.ActivationType.Gelu),
+            "doweight_stage1": self.a16w16(doweight_stage1=1),
+            "gfx90a": self.a16w16(gfx="gfx90a"),
+        }
+        for name, info in cases.items():
+            with self.subTest(name):
+                self.assertEqual(gen(info, BLOCK_MS), [])
+
+    def test_flydsl_bf16_activation_stage2_tile_k_divides_inter_dim(self):
+        # 384 = 3 * 128: tile_k 128 divides it, tile_k 256 does not.
+        def tile_ks(inter_dim):
+            params = self.flydsl_stage2_params(self.a16w4(inter_dim=inter_dim))
+            return {p["tile_k"] for p in params}
+
+        self.assertIn(256, tile_ks(3072))
+        self.assertTrue(tile_ks(384))
+        self.assertNotIn(256, tile_ks(384))
+
+    def test_flydsl_bf16_activation_stage2_fits_lds(self):
+        m = self.gemm_moe_tune
+        limit = 160 * 1024
+
+        def lds(p):
+            return p["tile_m"] * (p["tile_k"] * 2 + p["tile_n"] * 4)
+
+        catalog = m.get_flydsl_stage2_kernels("bf16", "fp4", "bf16")
+        self.assertTrue(
+            any(lds(p) > limit for p in catalog.values()),
+            "no catalog kernel exceeds the LDS limit; the filter is not exercised",
+        )
+        params = self.flydsl_stage2_params(self.a16w4(inter_dim=3072))
+        self.assertTrue(params)
+        self.assertEqual([p for p in params if lds(p) > limit], [])
 
     def test_flydsl_v2_skips_block_m_16(self):
         m = self.gemm_moe_tune
