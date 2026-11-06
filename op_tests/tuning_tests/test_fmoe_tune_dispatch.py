@@ -165,6 +165,7 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         q_type=None,
         act_type=None,
         doweight_stage1=0,
+        dtype=None,
     ):
         m = self.gemm_moe_tune
         return (
@@ -176,7 +177,7 @@ class TestFmoeTuneDispatch(unittest.TestCase):
             8,
             2,
             m.ActivationType.Silu if act_type is None else act_type,
-            m.torch.bfloat16,
+            m.torch.bfloat16 if dtype is None else dtype,
             m.dtypes.fp8 if q_dtype_a is None else q_dtype_a,
             m.dtypes.fp4x2 if q_dtype_w is None else q_dtype_w,
             m.QuantType.per_1x32 if q_type is None else q_type,
@@ -403,6 +404,68 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         )
         self.assertTrue(tasks)
         self.assertNotIn(16, {t[0][3] for t in tasks})
+
+    def test_flydsl_v2_rejects_doweight_and_non_bf16_output(self):
+        m = self.gemm_moe_tune
+        gen = self.tuner.gen_flydsl_v2_2stages_task
+        self.assertTrue(gen(self.info(), BLOCK_MS))
+        self.assertEqual(gen(self.info(doweight_stage1=1), BLOCK_MS), [])
+        self.assertEqual(gen(self.info(dtype=m.torch.float16), BLOCK_MS), [])
+
+    def test_flydsl_v2_stage2_tile_n_must_divide_model_dim(self):
+        # 5248 = 41 * 128: tile_n 128 divides it, tile_n 256 does not.
+        def tile_ns(model_dim):
+            tasks = self.tuner.gen_flydsl_v2_2stages_task(
+                self.info(model_dim=model_dim), BLOCK_MS
+            )
+            # Stage2 run args end with the kernel params.
+            return {t[4][-1]["tile_n"] for t in tasks if t[0][1] == "stage2"}
+
+        self.assertEqual(tile_ns(5120), {128, 256})
+        self.assertEqual(tile_ns(5248), {128})
+
+    def test_default_tune_only_keeps_v2_without_stage2(self):
+        # Current behavior, not a requirement: v2 stage1 has no inter_dim
+        # filter, so with inter_dim % 128 != 0 the default mode keeps v2 alone
+        # and submits stage1 with no stage2 to pair. TUNE_ONLY="" still
+        # pairs other backends.
+        m = self.gemm_moe_tune
+        frame = self.untuned(
+            token=32,
+            model_dim=5120,
+            inter_dim=1088,
+            q_dtype_a=str(m.dtypes.fp8),
+            q_dtype_w=str(m.dtypes.fp4x2),
+            q_type="QuantType.per_1x32",
+        )
+
+        def submitted(env):
+            got = {}
+
+            def fake_mp(tasks, *args, **kwargs):
+                got["tasks"] = list(tasks)
+                return []
+
+            cleaned = {k: v for k, v in os.environ.items() if k not in _TUNER_ENV}
+            cleaned.update(env)
+            with (
+                mock.patch.object(self.gemm_moe_tune, "get_gfx", return_value="gfx950"),
+                mock.patch.object(self.gemm_moe_tune, "mp_tuner", fake_mp),
+                mock.patch.dict(os.environ, cleaned, clear=True),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.tuner.tune(frame, None, self.args)
+            return got.get("tasks", [])
+
+        def block_ms(tasks, stage):
+            return {t[0][3] for t in tasks if t[0][1] == stage}
+
+        default = submitted({})
+        self.assertTrue(default)
+        self.assertEqual({t[0][1] for t in default}, {"stage1"})
+        self.assertTrue(all(t[0][5] == 1 for t in default))
+        every = submitted({"TUNE_ONLY": ""})
+        self.assertTrue(block_ms(every, "stage1") & block_ms(every, "stage2"))
 
     def test_grouped_candidate_names_follow_gate_and_tile(self):
         tuner = self.gemm_moe_tune.GroupedFmoeTuner(
