@@ -691,6 +691,7 @@ _GEN_DATA_1STAGE_KEYS = [
 class FmoeTuner(TunerCommon):
     SUPPORTS_FAST_SCAN = False
     SUPPORTS_POWER_SELECT = True
+    TAG_ROWS_DROPPED: ClassVar[str] = "all"
 
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
@@ -5539,13 +5540,7 @@ class FmoeTuner(TunerCommon):
                 else:
                     old_tunedf[col] = 0
 
-        # Legacy tuned files may carry an obsolete _tag column (and tagged
-        # rows). Drop the tagged rows and the column so the rewrite matches the
-        # current schema.
-        if "_tag" in old_tunedf.columns:
-            old_tunedf = old_tunedf[old_tunedf["_tag"].fillna("") == ""].drop(
-                columns=["_tag"]
-            )
+        old_tunedf = self._apply_tag_rule(old_tunedf)
 
         resultdf = self.update_tunedf(old_tunedf, results)
         self.success = pd.concat([self.success, results], ignore_index=True)
@@ -6401,13 +6396,6 @@ class FmoeTuner(TunerCommon):
                     mask = self._already_tuned_mask(dedup_cols)
                     self.untunedf = self.untunedf[~mask]
 
-    def _already_tuned_mask(self, dedup_cols: "list[str]") -> "pd.Series":
-        return (
-            self.untunedf[dedup_cols]
-            .apply(tuple, axis=1)
-            .isin(self.tunedf[dedup_cols].apply(tuple, axis=1))
-        )
-
     def e2e_tune(self, args):
         """
         Choosing best kernels based on (stage1_us + stage2_us) or (single_stage_us)
@@ -7037,6 +7025,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
     """
 
     SUPPORTS_FAST_SCAN = True
+    KERNEL_NAME_COLUMNS: ClassVar[tuple[str, ...]] = ("kernelName1", "kernelName2")
+    TAG_ROWS_DROPPED: ClassVar[str] = "fallback"
 
     def _setup_specific_arguments(self):
         super()._setup_specific_arguments()
@@ -7180,13 +7170,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
             return "topk must not exceed expert count"
         return None
 
-    @staticmethod
-    def _names_kernel(tunedf: "pd.DataFrame") -> "pd.Series":
-        """Rows naming a kernel are live configs, even without a timing."""
-        names = [c for c in ("kernelName1", "kernelName2") if c in tunedf]
-        kernels = tunedf[names].fillna("").astype(str)
-        return kernels.apply(lambda c: c.str.strip().ne("")).any(axis=1)
-
     def _drop_superseded_rows(
         self, tunedf: "pd.DataFrame", dedup_keys: "list[str]"
     ) -> "pd.DataFrame":
@@ -7222,12 +7205,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return tunedf[~(later & no_fallback) & ~placeholder]
 
     def _already_tuned_mask(self, dedup_cols: "list[str]") -> "pd.Series":
-        configured = self.tunedf[self._names_kernel(self.tunedf)]
-        mask = (
-            self.untunedf[dedup_cols]
-            .apply(tuple, axis=1)
-            .isin(configured[dedup_cols].apply(tuple, axis=1))
-        )
+        mask = super()._already_tuned_mask(dedup_cols)
         unsupported = self.untunedf.apply(
             lambda row: self._unsupported_row_reason(row) is not None, axis=1
         )
@@ -7278,11 +7256,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return [key for key in self.keys if key not in ("gfx", "cu_num")]
 
     def _normalize_tuned_csv(self, tunedf: "pd.DataFrame") -> "pd.DataFrame":
-        tunedf = super()._normalize_tuned_csv(tunedf)
-        # Runtime ignores only flydsl_fallback rows; every other tag is live.
-        if "_tag" in tunedf:
-            tags = tunedf["_tag"].fillna("").astype(str).str.strip()
-            tunedf = tunedf[tags.ne("flydsl_fallback")]
+        tunedf = self._apply_tag_rule(super()._normalize_tuned_csv(tunedf))
         for column in self.columns:
             if column not in tunedf:
                 tunedf[column] = "" if column.startswith("kernelName") else 0
