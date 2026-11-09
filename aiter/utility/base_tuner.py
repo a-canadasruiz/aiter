@@ -84,6 +84,13 @@ class TunerCommon:
     # Columns that count as a real package-power measurement. MoE's tuned row
     # uses ``watts`` (the stage-energy mean); stage columns stay on the profile.
     POWER_WATT_COLUMNS = ("watts",)
+    # Columns naming the tuned kernel. When set, a tuned row that names no
+    # kernel does not count as tuned, so pre_process tunes its shape again.
+    KERNEL_NAME_COLUMNS: ClassVar[tuple[str, ...]] = ()
+    # Tagged rows dropped from a tuned table: "none", "fallback" (only
+    # flydsl_fallback, which the runtime skips) or "all" (every tagged row and
+    # the _tag column).
+    TAG_ROWS_DROPPED: ClassVar[str] = "none"
 
     INVALID_TIME = -1  # op not support or error
 
@@ -779,6 +786,35 @@ class TunerCommon:
     ) -> "pd.DataFrame":
         """Drop duplicate-key rows that a later row supersedes."""
         return tunedf.drop_duplicates(subset=dedup_keys, keep="last")
+
+    def _names_kernel(self, tunedf: "pd.DataFrame") -> "pd.Series":
+        """Rows naming a kernel in KERNEL_NAME_COLUMNS, even without a timing."""
+        names = [c for c in self.KERNEL_NAME_COLUMNS if c in tunedf]
+        kernels = tunedf[names].fillna("").astype(str)
+        return kernels.apply(lambda c: c.str.strip().ne("")).any(axis=1)
+
+    def _already_tuned_mask(self, dedup_cols: "list[str]") -> "pd.Series":
+        """Untuned rows whose dedup_cols match a tuned row."""
+        tuned = self.tunedf
+        if self.KERNEL_NAME_COLUMNS:
+            tuned = tuned[self._names_kernel(tuned)]
+        return (
+            self.untunedf[dedup_cols]
+            .apply(tuple, axis=1)
+            .isin(tuned[dedup_cols].apply(tuple, axis=1))
+        )
+
+    def _apply_tag_rule(self, tunedf: "pd.DataFrame") -> "pd.DataFrame":
+        """Drop the tagged rows TAG_ROWS_DROPPED names."""
+        rule = self.TAG_ROWS_DROPPED
+        if rule not in ("none", "fallback", "all"):
+            raise ValueError(f"unknown TAG_ROWS_DROPPED: {rule!r}")
+        if rule == "none" or "_tag" not in tunedf:
+            return tunedf
+        if rule == "all":
+            return tunedf[tunedf["_tag"].fillna("") == ""].drop(columns=["_tag"])
+        tags = tunedf["_tag"].fillna("").astype(str).str.strip()
+        return tunedf[tags.ne("flydsl_fallback")]
 
     def get_cu_num(self):
         gpu = torch.cuda.current_device()
@@ -1938,11 +1974,8 @@ class GemmCommonTuner(TunerCommon):
             if "gfx" not in self.tunedf.columns and "gfx" in self.untunedf.columns:
                 self.tunedf.insert(0, "gfx", self.get_gfx())
 
-            untunedf_cols = self.untunedf.columns
             if len(self.tunedf) != 0:
-                mask = self.untunedf.apply(tuple, axis=1).isin(
-                    self.tunedf[untunedf_cols].apply(tuple, axis=1)
-                )
+                mask = self._already_tuned_mask(list(self.untunedf.columns))
                 if args.verbose:
                     logger.info("skiped tuned shapes:")
                     print(self.untunedf[mask])
