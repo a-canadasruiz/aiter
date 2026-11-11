@@ -420,6 +420,7 @@ def _select_mxfp4_accuracy_promotion(candidates, performance_finalists):
 
 class FmoeTuner(TunerCommon):
     SUPPORTS_FAST_SCAN = False
+    SUPPORTS_MXFP4_SEARCH_MODE = False
     SUPPORTS_POWER_SELECT = True
     TAG_ROWS_DROPPED: ClassVar[str] = "all"
 
@@ -487,7 +488,7 @@ class FmoeTuner(TunerCommon):
         mxfp4_port = (
             args.mxfp4_flydsl
             and not args.grouped_gemm
-            and isinstance(self, Mxfp4FlydslTuner)
+            and self.SUPPORTS_MXFP4_SEARCH_MODE
         )
         # None distinguishes an omitted mode from an explicit one.
         if args.mxfp4_search_mode is not None and not mxfp4_port:
@@ -2696,6 +2697,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
     """
 
     SUPPORTS_FAST_SCAN = True
+    SUPPORTS_MXFP4_SEARCH_MODE = True
     KERNEL_NAME_COLUMNS: ClassVar[tuple[str, ...]] = ("kernelName1", "kernelName2")
     TAG_ROWS_DROPPED: ClassVar[str] = "fallback"
 
