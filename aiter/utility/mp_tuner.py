@@ -20,14 +20,14 @@ _TASK_PIDS = None
 _ROCPROFILER_ENV = ("ROCPROFILER_REGISTER_LIBRARY", "HSA_TOOLS_ROCPROFILER_V1_TOOLS")
 
 
-def _new_pool(parallel_num, task_start_times, task_pids):
+def _new_pool(parallel_num, task_start_times, task_pids, default_device=None):
     for name in _ROCPROFILER_ENV:
         os.environ.pop(name, None)
         os.unsetenv(name)
     return mp.Pool(
         processes=parallel_num,
         initializer=_init_task_start_times,
-        initargs=(task_start_times, task_pids),
+        initargs=(task_start_times, task_pids, default_device),
     )
 
 
@@ -39,9 +39,11 @@ def _is_accelerator_error(exc: BaseException) -> bool:
     return type(exc).__name__ == "AcceleratorError"
 
 
-def _init_task_start_times(task_start_times, task_pids=None):
+def _init_task_start_times(task_start_times, task_pids=None, default_device=None):
     global _TASK_START_TIMES, _TASK_PIDS
     configure_worker_subprocesses()
+    if default_device is not None:
+        torch.set_default_device(default_device)
     _TASK_START_TIMES = task_start_times
     _TASK_PIDS = task_pids
 
@@ -443,6 +445,8 @@ def mp_tuner(
     verbose=False,  # print verbose log
     policy=None,
     final_timing=None,
+    *,
+    default_device=None,
 ):
     """Multi-process tuner with GPU fault isolation.
 
@@ -461,6 +465,9 @@ def mp_tuner(
         policy: SelectionPolicy for the run; None uses the one the tuner activated
         final_timing: whether these times pick the winner (default: not fast_mode).
             Only a final timing pass is power-sampled.
+        default_device: if set, each worker calls ``torch.set_default_device``
+            with this value once at process start. ``None`` leaves the default
+            unchanged. Pass ``"cuda"`` (current device), not ``"cuda:0"``.
 
     Returns:
         List of (info, latency, error_ratio) tuples
@@ -553,7 +560,7 @@ def mp_tuner(
     # Create initial pool and submit all tasks
     task_start_times = mp.RawArray("d", len(task_group))
     task_pids = mp.RawArray("i", len(task_group))
-    pool = _new_pool(parallel_num, task_start_times, task_pids)
+    pool = _new_pool(parallel_num, task_start_times, task_pids, default_device)
     pid_delay = 0 if mp_num == 1 else 3
     pids = [
         pool.apply_async(get_pid, args=(pid_delay,)) for i in range(start_idx, mp_num)
@@ -754,7 +761,7 @@ def mp_tuner(
             except Exception as e:  # noqa: BLE001
                 print(f"Warning: Error during pool termination: {e}", flush=True)
             # Create new pool
-            pool = _new_pool(parallel_num, task_start_times, task_pids)
+            pool = _new_pool(parallel_num, task_start_times, task_pids, default_device)
 
             # Recreate gpu_map for new processes (new PIDs)
             pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
