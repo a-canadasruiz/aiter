@@ -897,6 +897,31 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         )
         self.assertEqual(separated["kernelName1"], "grouped_gemm1_a8w4_gguu")
 
+    def test_grouped_tune_skips_invalid_times(self):
+        tuner = self.gemm_moe_tune.GroupedFmoeTuner(
+            "groupedFmoe", KEYS, ["kernelName1", "us"], "grouped"
+        )
+        args = SimpleNamespace(tune_file="unused.csv", select="latency")
+        frame = self.untuned(q_dtype_a="torch.float4_e2m1fn_x2")
+        nan = float("nan")
+        cases = {
+            "valid among invalid": ([nan, 0.0, 5.0, -2.0], 5.0, 64),
+            "all invalid": ([nan, 0.0, -2.0, float("-inf")], -1, 16),
+        }
+        for name, (times, us, tile_m) in cases.items():
+            with (
+                self.subTest(name),
+                mock.patch.object(tuner, "_write_layout"),
+                mock.patch.object(tuner, "_run_candidate", side_effect=times),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                (best,) = tuner.tune(frame, None, args)
+                self.assertEqual(best["us"], us)
+                self.assertEqual(best["tile_m"], tile_m)
+                if us == -1:
+                    self.assertTrue(best["kernelName1"].startswith("FAILED: "))
+                    self.assertIn("invalid time nan", best["kernelName1"])
+
     def test_grouped_and_mxfp4_post_process_keep_watts(self):
         m = self.gemm_moe_tune
         cases = (

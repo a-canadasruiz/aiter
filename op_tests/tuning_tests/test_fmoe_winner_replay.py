@@ -273,6 +273,38 @@ class TestFmoeWinnerReplay(unittest.TestCase):
         ]
         self.assertWinner(results, two_stage(2.0, 1.0, kernel1="s1_ok"))
 
+    def test_nan_zero_and_negative_times_are_dropped(self):
+        results = [
+            self.cand("stage1", "s1_nan", float("nan")),
+            self.cand("stage1", "s1_zero", 0.0),
+            self.cand("stage1", "s1_negative", -2.0),
+            self.cand("stage1", "s1_ok", 2.0),
+            self.cand("stage2", "s2_zero", 0.0),
+            self.cand("stage2", "s2_ok", 1.0),
+        ]
+        self.assertWinner(
+            results, two_stage(2.0, 1.0, kernel1="s1_ok", kernel2="s2_ok")
+        )
+
+    def test_candidate_dump_marks_invalid_times(self):
+        inf = float("inf")
+        frame = self.pd.DataFrame(
+            {
+                "us": [float("nan"), 0.0, -2.0, -1, inf, -inf, 2.0, 3.0],
+                "err": [0.0] * 7 + [0.5],
+            }
+        )
+        with (
+            tempfile.TemporaryDirectory() as root,
+            mock.patch.dict(os.environ, {"AITER_TUNE_CANDIDATE_DUMP_DIR": root}),
+        ):
+            self.fused_moe._dump_prefilter_candidates(frame, self.args, "dump")
+            out = self.pd.read_csv(Path(root, "dump.csv"), keep_default_na=False)
+        self.assertEqual(
+            out["filter_reason"].tolist(),
+            ["invalid_time"] * 6 + ["", "err_ratio"],
+        )
+
     def test_power_select_prefers_lower_energy(self):
         # Pair energy is us1*watts1 + us2*watts2. These inputs make latency
         # and power disagree, so a refactor that keeps idxmin(us) fails.

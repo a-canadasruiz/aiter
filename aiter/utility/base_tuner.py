@@ -877,6 +877,11 @@ class TunerCommon:
     def get_gfx(self):
         return chip_info.get_gfx_runtime()
 
+    @staticmethod
+    def valid_time(us) -> bool:
+        """A timing a candidate can win with: finite and above zero."""
+        return math.isfinite(us) and us > 0
+
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         """post process, post process all results to return topk results"""
         from aiter.utility.tune_result import TuneResult
@@ -915,15 +920,15 @@ class TunerCommon:
             tol_err_ratio = args.errRatio
             # Drop invalid candidates before sorting: a NaN timing makes every
             # comparison False, so sorting first leaves the list out of order.
-            valid_time = [
+            valid = [
                 (info_ex, us, max_err_ratio, watts)
                 for info_ex, us, max_err_ratio, watts in time_list
-                if max_err_ratio <= tol_err_ratio and math.isfinite(us) and us > 0
+                if max_err_ratio <= tol_err_ratio and self.valid_time(us)
             ]
             filtered_time = [
                 (info_ex, round(us, 4), max_err_ratio, watts)
                 for info_ex, us, max_err_ratio, watts in sorted(
-                    valid_time, key=lambda x: policy.rank(x[1], x[3])
+                    valid, key=lambda x: policy.rank(x[1], x[3])
                 )
             ]
             if len(filtered_time) == 0:
@@ -2298,7 +2303,7 @@ class GemmCommonTuner(TunerCommon):
         ### bpes: (inbpe, w_bpe, outbpe)
         ### gemm flops,bw
         info, time, _err_ratio = results
-        if not math.isfinite(time) or time <= 0:
+        if not self.valid_time(time):
             return 0, 0
         if len(info[0]) >= 5:  # gfx-aware key: (gfx, cu_num, m, n, k, ...)
             _gfx, _cu_num, m, n, k, *_rest = info[0]

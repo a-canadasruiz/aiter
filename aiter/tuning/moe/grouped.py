@@ -262,6 +262,8 @@ class GroupedFmoeTuner(FmoeTuner):
             for candidate in self._candidate_rows(row):
                 try:
                     us = self._run_candidate(row, candidate, args)
+                    if not self.valid_time(us):
+                        raise ValueError(f"invalid time {us}")
                     candidate["us"] = us
                     watt_text = policy.watt_text(candidate.get("watts"))
                     print(
@@ -391,12 +393,9 @@ class GroupedFmoeTuner(FmoeTuner):
     def result_to_csv(self, results, file, concat=False):
         del concat
         columns, old_rows, no_blanks = self._write_layout(file)
-        valid = results[
-            (results["us"] != self.INVALID_TIME) & (results["us"] != self.INF_TIME)
-        ]
-        invalid = results[
-            (results["us"] == self.INVALID_TIME) | (results["us"] == self.INF_TIME)
-        ]
+        invalid_time = ~results["us"].map(self.valid_time).astype(bool)
+        valid = results[~invalid_time]
+        invalid = results[invalid_time]
         self.success = pd.concat([self.success, valid], ignore_index=True)
         self.failed = pd.concat([self.failed, invalid], ignore_index=True)
         keys = [k for k in self.keys if k in columns]

@@ -353,6 +353,14 @@ class TestPostProcess(unittest.TestCase):
         self.assertEqual(len(resultdf), 1)
         self.assertEqual(float(resultdf.iloc[0]["us"]), 7.0)
 
+    def test_valid_time_accepts_only_finite_positive_times(self):
+        from aiter.utility.base_tuner import TunerCommon
+
+        for us in (float("inf"), float("-inf"), float("nan"), 0, 0.0, -1, -2.5):
+            self.assertFalse(TunerCommon.valid_time(us), us)
+        for us in (1e-4, 3, 5.0):
+            self.assertTrue(TunerCommon.valid_time(us), us)
+
     def test_nan_between_valid_times_does_not_break_selection(self):
         """A NaN timing must not disturb the order of the valid candidates."""
         tuner = _StubTuner.get()
@@ -874,6 +882,31 @@ class TestGroupedFmoeResultToCsv(unittest.TestCase):
             self.assertEqual(new_4096["us"], "300.5")
             # A shape the file does not have yet is appended.
             self.assertEqual(lines[3].split(",")[2], "2048")
+        finally:
+            os.unlink(path)
+
+    def test_invalid_times_are_failed_and_not_written(self):
+        tuner = self._tuner()
+        old_4096 = f"gfx1250,256,4096,{self.SHAPE},4096,16,256,256,16,1,4,2,1,0,,k1,k2,468.0528,0,0"
+        old_8192 = f"gfx1250,256,8192,{self.SHAPE},8192,64,256,256,,1,4,2,1,0,,k1,k2,2011.94,0,0"
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            f.write(f"{self.HEADER}\n{old_4096}\n{old_8192}\n")
+            path = f.name
+        try:
+            invalid = [-1, float("inf"), float("-inf"), float("nan"), 0.0, -2.0]
+            results = pd.DataFrame(
+                [self._candidate(4096, 64, us) for us in invalid]
+                + [self._candidate(2048, 32, 250.25)],
+                columns=tuner.columns,
+            )
+            tuner.result_to_csv(results, path)
+            with open(path) as f:
+                lines = f.read().splitlines()
+            self.assertEqual(lines[:3], [self.HEADER, old_4096, old_8192])
+            self.assertEqual(len(lines), 4)
+            self.assertEqual(lines[3].split(",")[2], "2048")
+            self.assertEqual(len(tuner.success), 1)
+            self.assertEqual(len(tuner.failed), len(invalid))
         finally:
             os.unlink(path)
 

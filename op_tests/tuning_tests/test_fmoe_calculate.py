@@ -75,7 +75,14 @@ class TestFmoeCalculate(unittest.TestCase):
 
     def test_invalid_time_reports_nothing(self):
         for stage in ("stage1", "stage2", ""):
-            for us in (self.tuner.INVALID_TIME, self.tuner.INF_TIME):
+            for us in (
+                self.tuner.INVALID_TIME,
+                self.tuner.INF_TIME,
+                float("-inf"),
+                float("nan"),
+                0.0,
+                -2.0,
+            ):
                 with self.subTest(stage=stage, us=us):
                     self.assertEqual(self.calculate(stage, us), (0, 0))
 

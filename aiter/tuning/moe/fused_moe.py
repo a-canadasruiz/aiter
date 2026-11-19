@@ -145,6 +145,11 @@ def _candidate_dump_tag(
     )
 
 
+def _invalid_time(us):
+    """Rows whose timing TunerCommon.valid_time rejects."""
+    return ~us.map(TunerCommon.valid_time).astype(bool)
+
+
 def _dump_prefilter_candidates(profile_df, args, stage_tag):
     root = os.environ.get("AITER_TUNE_CANDIDATE_DUMP_DIR")
     if not root:
@@ -152,7 +157,7 @@ def _dump_prefilter_candidates(profile_df, args, stage_tag):
     out = profile_df.copy()
     out["passed_err_ratio"] = out["err"] <= args.errRatio
     out["filter_reason"] = ""
-    invalid_time = out["us"].isin([float("inf"), float("-inf"), -1])
+    invalid_time = _invalid_time(out["us"])
     out.loc[invalid_time, "filter_reason"] = "invalid_time"
     out.loc[(out["err"] > args.errRatio) & ~invalid_time, "filter_reason"] = "err_ratio"
     Path(root).mkdir(parents=True, exist_ok=True)
@@ -432,7 +437,7 @@ class FmoeTuner(TunerCommon):
             use_g1u1,
             _doweight_stage1,
         ) = key
-        if us == self.INVALID_TIME or us == self.INF_TIME:
+        if not self.valid_time(us):
             return 0, 0
         flop = 0
         data_bytes = 0
@@ -1046,7 +1051,7 @@ class FmoeTuner(TunerCommon):
             failed_cases = []
             for i, ret in enumerate(rets):
                 info, us, err = ret
-                if us == float("inf") or us == -1:
+                if not self.valid_time(us):
                     tag = dispatched.get(i, info)
                     failed_cases.append((i, tag, us, err))
             if failed_cases:
@@ -1265,8 +1270,8 @@ class FmoeTuner(TunerCommon):
                 doweight_stage1,
             )
             _dump_prefilter_candidates(profileDF, args, dump_tag)
+            invalid_time = _invalid_time(profileDF["us"])
             if args.verbose:
-                invalid_time = profileDF["us"].isin([float("inf"), float("-inf"), -1])
                 passed = profileDF["err"] <= args.errRatio
                 eligible = passed & ~invalid_time
                 print(
@@ -1277,12 +1282,7 @@ class FmoeTuner(TunerCommon):
                 )
 
             ## remove invalid candidate
-            profileDF = profileDF[
-                (profileDF["us"] != float("-inf"))
-                & (profileDF["us"] != float("inf"))
-                & (profileDF["us"] != -1)
-                & (profileDF["err"] <= args.errRatio)
-            ]
+            profileDF = profileDF[~invalid_time & (profileDF["err"] <= args.errRatio)]
             # a16w16 stage1 writes a SORTED intermediate that only the a16w16
             # stage2 reads, and CK stage2 cannot read it; both share BF16
             # QuantType.No keys, so dedup and pair them on separate sides.
