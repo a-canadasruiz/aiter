@@ -491,399 +491,376 @@ class FmoeTuner(TunerCommon):
         return tflops, bw
 
     def run_config(self, args, target_fused_moe=None, config_string=""):
-        from aiter.fused_moe import fused_moe, fused_topk
-        from aiter.test_common import checkAllclose, run_perftest
-
         if target_fused_moe is None:
+            from aiter.fused_moe import fused_moe
+
             target_fused_moe = fused_moe
         untunedf = self.untunedf
-        results = []
-        for i in range(len(untunedf)):
-            row = untunedf.iloc[i]
-            token = int(row["token"])
-            model_dim = int(row["model_dim"])
-            inter_dim = int(row["inter_dim"])
-            expert = int(row["expert"])
-            topk = int(row["topk"])
-            act_type = eval(row["act_type"])
-            dtype = eval(row["dtype"])
-            q_dtype_a = dtypes.normalize_fp8_dtype(eval(row["q_dtype_a"]))
-            q_dtype_w = dtypes.normalize_fp8_dtype(eval(row["q_dtype_w"]))
-            q_type = eval(row["q_type"])
-            q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
-            use_g1u1 = bool(row["use_g1u1"])
-            doweight_stage1 = bool(row["doweight_stage1"])
-            limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
-            swiglu_limit = None if limit_env in (None, "") else float(limit_env)
-            # fused_moe overrides the activation quant dtype at runtime for
-            # per_1x32 fp4-weight MoE (gate_mode defaults to SEPARATED, which
-            # run_config does not override): Silu -> fp4, Swiglu -> bf16/fp4 by M.
-            # The config's nominal q_dtype_a (e.g. a8w4=fp8) is ignored, so the
-            # kernel actually runs a4w4. Mirror that here so the reference and the
-            # kernel weight layout match (else outputs are uncorrelated).
-            # Source of truth: aiter/fused_moe.py q_dtype_a selection.
-            eff_q_dtype_a = q_dtype_a
-            if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2:
-                if act_type == ActivationType.Swiglu:
-                    eff_q_dtype_a = dtypes.bf16 if token < 256 else dtypes.fp4x2
-                else:
-                    eff_q_dtype_a = dtypes.fp4x2
-            shape_str = (
-                f"({token}, {model_dim}, {inter_dim}, E={expert}, topk={topk}, "
-                f"{row['act_type']}, {row['dtype']}, {row['q_dtype_a']}, "
-                f"{row['q_dtype_w']}, {row['q_type']}, g1u1={use_g1u1}, "
-                f"dw_s1={doweight_stage1})"
-            )
-            allowed_err_ratio, allowed_err_ratio_desc = (
-                self._get_run_config_err_ratio_limit(row, args)
-            )
-            kernel_us = None
-            if "us" in row and pd.notna(row["us"]):
-                try:
-                    kernel_us = float(row["us"])
-                except (TypeError, ValueError):
-                    kernel_us = None
+        return [
+            self.run_config_row(untunedf.iloc[i], target_fused_moe, args)
+            for i in range(len(untunedf))
+        ]
+
+    def run_config_row(self, row, target_fused_moe, args):
+        """Run one untuned-CSV row through ``target_fused_moe``, compare it
+        with the torch reference and return its run_config result."""
+        from aiter.fused_moe import fused_topk
+        from aiter.test_common import checkAllclose, run_perftest
+
+        token = int(row["token"])
+        model_dim = int(row["model_dim"])
+        inter_dim = int(row["inter_dim"])
+        expert = int(row["expert"])
+        topk = int(row["topk"])
+        act_type = eval(row["act_type"])
+        dtype = eval(row["dtype"])
+        q_dtype_a = dtypes.normalize_fp8_dtype(eval(row["q_dtype_a"]))
+        q_dtype_w = dtypes.normalize_fp8_dtype(eval(row["q_dtype_w"]))
+        q_type = eval(row["q_type"])
+        q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
+        use_g1u1 = bool(row["use_g1u1"])
+        doweight_stage1 = bool(row["doweight_stage1"])
+        limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
+        swiglu_limit = None if limit_env in (None, "") else float(limit_env)
+        # fused_moe overrides the activation quant dtype at runtime for
+        # per_1x32 fp4-weight MoE (gate_mode defaults to SEPARATED, which
+        # run_config does not override): Silu -> fp4, Swiglu -> bf16/fp4 by M.
+        # The config's nominal q_dtype_a (e.g. a8w4=fp8) is ignored, so the
+        # kernel actually runs a4w4. Mirror that here so the reference and the
+        # kernel weight layout match (else outputs are uncorrelated).
+        # Source of truth: aiter/fused_moe.py q_dtype_a selection.
+        eff_q_dtype_a = q_dtype_a
+        if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2:
+            if act_type == ActivationType.Swiglu:
+                eff_q_dtype_a = dtypes.bf16 if token < 256 else dtypes.fp4x2
+            else:
+                eff_q_dtype_a = dtypes.fp4x2
+        shape_str = (
+            f"({token}, {model_dim}, {inter_dim}, E={expert}, topk={topk}, "
+            f"{row['act_type']}, {row['dtype']}, {row['q_dtype_a']}, "
+            f"{row['q_dtype_w']}, {row['q_type']}, g1u1={use_g1u1}, "
+            f"dw_s1={doweight_stage1})"
+        )
+        allowed_err_ratio, allowed_err_ratio_desc = (
+            self._get_run_config_err_ratio_limit(row, args)
+        )
+        kernel_us = None
+        if "us" in row and pd.notna(row["us"]):
             try:
-                torch.manual_seed(0)
-                hidden = (
-                    torch.randn((token, model_dim), dtype=dtype, device="cuda") / 10
+                kernel_us = float(row["us"])
+            except (TypeError, ValueError):
+                kernel_us = None
+        try:
+            torch.manual_seed(0)
+            hidden = torch.randn((token, model_dim), dtype=dtype, device="cuda") / 10
+            if use_g1u1:
+                w1 = (
+                    torch.randn(
+                        (expert, inter_dim * 2, model_dim),
+                        dtype=dtype,
+                        device="cuda",
+                    )
+                    / 10
                 )
-                if use_g1u1:
-                    w1 = (
-                        torch.randn(
-                            (expert, inter_dim * 2, model_dim),
-                            dtype=dtype,
-                            device="cuda",
-                        )
-                        / 10
+            else:
+                w1 = (
+                    torch.randn(
+                        (expert, inter_dim, model_dim), dtype=dtype, device="cuda"
                     )
-                else:
-                    w1 = (
-                        torch.randn(
-                            (expert, inter_dim, model_dim), dtype=dtype, device="cuda"
-                        )
-                        / 10
-                    )
-                w2 = torch.randn(
-                    (expert, model_dim, inter_dim), dtype=dtype, device="cuda"
+                    / 10
                 )
-                w1_qt, w1_scale = self.weight_quant(w1, q_type, quant_dtype=q_dtype_w)
-                w2_qt, w2_scale = self.weight_quant(w2, q_type, quant_dtype=q_dtype_w)
-                if q_dtype_w is not dtypes.fp4x2:
-                    w1_qt = w1_qt.view(w1.shape)
-                    w2_qt = w2_qt.view(w2.shape)
-                else:
-                    w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
-                    w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+            w2 = torch.randn((expert, model_dim, inter_dim), dtype=dtype, device="cuda")
+            w1_qt, w1_scale = self.weight_quant(w1, q_type, quant_dtype=q_dtype_w)
+            w2_qt, w2_scale = self.weight_quant(w2, q_type, quant_dtype=q_dtype_w)
+            if q_dtype_w is not dtypes.fp4x2:
+                w1_qt = w1_qt.view(w1.shape)
+                w2_qt = w2_qt.view(w2.shape)
+            else:
+                w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
+                w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
 
-                # Match the production/test path used by op_tests/test_moe_2stage.py.
-                w1_qt_fmoe = w1_qt
-                w2_qt_fmoe = w2_qt
-                w1_scale_fmoe = w1_scale
-                w2_scale_fmoe = w2_scale
-                if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
-                    # a16wi4 OLD-kernel preshuffle -- match production/test_moe_2stage.py.
-                    w1_qt_fmoe = (
-                        pack_int8_to_packed_int4(
-                            shuffle_weight(w1_qt_fmoe.view(dtypes.i8), (16, 16))
-                        )
-                        .view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
-                        .view(dtypes.i4x2)
+            # Match the production/test path used by op_tests/test_moe_2stage.py.
+            w1_qt_fmoe = w1_qt
+            w2_qt_fmoe = w2_qt
+            w1_scale_fmoe = w1_scale
+            w2_scale_fmoe = w2_scale
+            if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
+                # a16wi4 OLD-kernel preshuffle -- match production/test_moe_2stage.py.
+                w1_qt_fmoe = (
+                    pack_int8_to_packed_int4(
+                        shuffle_weight(w1_qt_fmoe.view(dtypes.i8), (16, 16))
                     )
-                    w2_qt_fmoe = (
-                        pack_int8_to_packed_int4(
-                            shuffle_weight(w2_qt_fmoe.view(dtypes.i8), (16, 16))
-                        )
-                        .view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
-                        .view(dtypes.i4x2)
-                    )
-                    w1_scale_fmoe = (
-                        shuffle_scale_for_int4(w1_scale, group_size=32)
-                        .view(-1)
-                        .contiguous()
-                    )
-                    w2_scale_fmoe = (
-                        shuffle_scale_for_int4(w2_scale, group_size=32)
-                        .view(-1)
-                        .contiguous()
-                    )
-                elif q_dtype_w == torch.int4:
-                    w1_qt_fmoe = rearrange_4bit_elements(
-                        convert_int8_to_uint32_int4(
-                            shuffle_weight(w1_qt_fmoe, (16, 16), use_int4=True)
-                        )
-                    )
-                    w2_qt_fmoe = rearrange_4bit_elements(
-                        convert_int8_to_uint32_int4(
-                            shuffle_weight(w2_qt_fmoe, (16, 16), use_int4=True)
-                        )
-                    )
-                    w1_scale_fmoe = (
-                        fp4_utils.e8m0_shuffle(w1_scale)
-                        if w1_scale is not None
-                        else None
-                    )
-                    w2_scale_fmoe = (
-                        fp4_utils.e8m0_shuffle(w2_scale)
-                        if w2_scale is not None
-                        else None
-                    )
-                elif (
-                    q_type == QuantType.per_1x32
-                    and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
-                    and q_dtype_w == dtypes.fp4x2
-                ):
-                    # a16w4 / a8w4 (16-bit or fp8 activation, fp4 weight): the
-                    # weight layout follows the *config* activation dtype, not the
-                    # runtime-effective one (mirror op_tests/test_moe_2stage.py):
-                    # a16w4 takes the standard GGUU W1, a8w4 the gate/up-
-                    # interleaved GUGU one, as in the tuning path.
-                    w1_gu = q_dtype_a == dtypes.fp8
-                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, w1_gu)
-                    w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, w1_gu)
-                    w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
-                    w2_scale_fmoe = shuffle_scale_a16w4(w2_scale, expert, False)
-                elif (
-                    q_type == QuantType.per_1x32
-                    and q_dtype_a == dtypes.fp4x2
-                    and q_dtype_w == dtypes.fp4x2
-                ):
-                    # a4w4 (fp4 activation/weight): standard (16,16) weight shuffle
-                    # + e8m0 scale shuffle (mirror test_moe_2stage preshuffle path).
-                    w1_qt_fmoe = shuffle_weight(w1_qt_fmoe, layout=(16, 16))
-                    w2_qt_fmoe = shuffle_weight(w2_qt_fmoe, layout=(16, 16))
-                    w1_scale_fmoe = fp4_utils.e8m0_shuffle(w1_scale)
-                    w2_scale_fmoe = fp4_utils.e8m0_shuffle(w2_scale)
-                elif (
-                    q_type == QuantType.per_1x32
-                    and q_dtype_a == dtypes.fp8
-                    and q_dtype_w == dtypes.fp8
-                ):
-                    # mxfp8 (a8w8): gate-up interleaved fp8 weight; w1 scale uses the
-                    # a16w4 interleave, w2 scale uses plain e8m0 (mirror
-                    # op_tests/test_moe_2stage.py is_mxfp8).
-                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
-                    w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
-                    w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
-                    w2_scale_fmoe = fp4_utils.e8m0_shuffle(w2_scale)
-                elif q_dtype_w != dtypes.fp4x2:
-                    w1_qt_fmoe = shuffle_weight(w1_qt_fmoe, (16, 16))
-                    w2_qt_fmoe = shuffle_weight(w2_qt_fmoe, (16, 16))
-                    w1_scale_fmoe = (
-                        fp4_utils.e8m0_shuffle(w1_scale)
-                        if w1_scale is not None
-                        else None
-                    )
-                    w2_scale_fmoe = (
-                        fp4_utils.e8m0_shuffle(w2_scale)
-                        if w2_scale is not None
-                        else None
-                    )
-                else:
-                    w1_scale_fmoe = (
-                        fp4_utils.e8m0_shuffle(w1_scale)
-                        if w1_scale is not None
-                        else None
-                    )
-                    w2_scale_fmoe = (
-                        fp4_utils.e8m0_shuffle(w2_scale)
-                        if w2_scale is not None
-                        else None
-                    )
-
-                w1_qt_fmoe.is_shuffled = True
-                w2_qt_fmoe.is_shuffled = True
-
-                score = torch.randn((token, expert), dtype=dtype, device="cuda")
-                topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
-                if q_type == QuantType.per_1x128:
-                    a1_qt, a1_scale = aiter.pertoken_quant(
-                        hidden.view(token, -1, 128), quant_dtype=q_dtype_a
-                    )
-                    a1_qt = a1_qt.view(token, model_dim)
-                    a1_scale = a1_scale.squeeze(-1)
-                elif q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
-                    a1_qt = hidden.to(dtypes.bf16)
-                    a1_scale = None
-                elif (
-                    q_type == QuantType.per_1x32
-                    and eff_q_dtype_a in [dtypes.bf16, dtypes.fp16]
-                    and q_dtype_w == dtypes.fp4x2
-                ):
-                    # a16w4 (bf16 activation): reference runs activation in bf16.
-                    a1_qt = hidden.to(dtype)
-                    a1_scale = None
-                elif (
-                    q_type == QuantType.per_1x32
-                    and q_dtype_a == dtypes.fp8
-                    and q_dtype_w == dtypes.fp8
-                ):
-                    # mxfp8 (a8w8): kernel quantizes the activation internally; the
-                    # reference runs activation in bf16 (mirror test_moe_2stage).
-                    a1_qt = hidden.to(dtype)
-                    a1_scale = None
-                else:
-                    # Use the *effective* activation dtype (what fused_moe runs),
-                    # not the config's nominal q_dtype_a. For Silu+SEPARATED fp4
-                    # weights this is fp4x2 (a4w4), so the reference quantizes the
-                    # activation to fp4 to match the kernel.
-                    torch_quant = aiter.get_torch_quant(q_type)
-                    a1_qt, a1_scale = torch_quant(hidden, quant_dtype=eff_q_dtype_a)
-
-                out, us = run_perftest(
-                    target_fused_moe,
-                    hidden,
-                    w1_qt_fmoe,
-                    w2_qt_fmoe,
-                    topk_weights,
-                    topk_ids,
-                    activation=act_type,
-                    quant_type=q_type,
-                    doweight_stage1=doweight_stage1,
-                    # The torch reference runs SiTUv2 with the model's betas;
-                    # fused_moe defaults to 1.0. Without this every Situv2 shape
-                    # reports logits_diff ~0.14 (out_norm/ref_norm ~0.61)
-                    # regardless of which kernel it dispatched.
-                    beta=(
-                        DEFAULT_SITUV2_BETA
-                        if act_type == ActivationType.Situv2
-                        else None
-                    ),
-                    linear_beta=(
-                        DEFAULT_SITUV2_LINEAR_BETA
-                        if act_type == ActivationType.Situv2
-                        else None
-                    ),
-                    swiglu_limit=swiglu_limit,
-                    w1_scale=w1_scale_fmoe,
-                    w2_scale=w2_scale_fmoe,
-                    dtype=dtype,
-                    num_warmup=args.warmup,
-                    num_iters=args.iters,
+                    .view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
+                    .view(dtypes.i4x2)
                 )
-                # a16wi4: per_1x32_i4_quant stores int4 in an int8 container.
-                # The torch reference detects int4 weights by the i4x2 dtype, so
-                # pass an i4x2-reinterpreted view to the reference only (the kernel
-                # path above consumes the int8 w*_qt). Mirrors op_tests/test_moe_2stage.py.
-                w1_qt_ref, w2_qt_ref = w1_qt, w2_qt
-                if q_type == QuantType.per_1x32 and w1_qt.dtype == dtypes.i8:
-                    w1_qt_ref = w1_qt.view(dtypes.i4x2)
-                    w2_qt_ref = w2_qt.view(dtypes.i4x2)
-                ref = self.torch_moe_2stages(
-                    a1_qt,
-                    w1_qt_ref,
-                    w2_qt_ref,
-                    topk_weights,
-                    topk_ids,
-                    a1_scale=a1_scale,
-                    w1_scale=w1_scale,
-                    w2_scale=w2_scale,
-                    dtype=dtype,
-                    activation=act_type,
-                    quant_type=q_type,
-                    doweight_stage1=doweight_stage1,
-                    swiglu_limit=swiglu_limit,
+                w2_qt_fmoe = (
+                    pack_int8_to_packed_int4(
+                        shuffle_weight(w2_qt_fmoe.view(dtypes.i8), (16, 16))
+                    )
+                    .view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+                    .view(dtypes.i4x2)
                 )
-                if not _all_finite(out) or not _all_finite(ref):
-                    diag = tensor_compare_diagnostics(ref, out)
-                    status = f"error:nonfinite output or reference; {diag}"
-                    err_ratio = 1.0
-                elif out.count_nonzero() == 0 and ref.count_nonzero() > 0:
+                w1_scale_fmoe = (
+                    shuffle_scale_for_int4(w1_scale, group_size=32)
+                    .view(-1)
+                    .contiguous()
+                )
+                w2_scale_fmoe = (
+                    shuffle_scale_for_int4(w2_scale, group_size=32)
+                    .view(-1)
+                    .contiguous()
+                )
+            elif q_dtype_w == torch.int4:
+                w1_qt_fmoe = rearrange_4bit_elements(
+                    convert_int8_to_uint32_int4(
+                        shuffle_weight(w1_qt_fmoe, (16, 16), use_int4=True)
+                    )
+                )
+                w2_qt_fmoe = rearrange_4bit_elements(
+                    convert_int8_to_uint32_int4(
+                        shuffle_weight(w2_qt_fmoe, (16, 16), use_int4=True)
+                    )
+                )
+                w1_scale_fmoe = (
+                    fp4_utils.e8m0_shuffle(w1_scale) if w1_scale is not None else None
+                )
+                w2_scale_fmoe = (
+                    fp4_utils.e8m0_shuffle(w2_scale) if w2_scale is not None else None
+                )
+            elif (
+                q_type == QuantType.per_1x32
+                and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
+                and q_dtype_w == dtypes.fp4x2
+            ):
+                # a16w4 / a8w4 (16-bit or fp8 activation, fp4 weight): the
+                # weight layout follows the *config* activation dtype, not the
+                # runtime-effective one (mirror op_tests/test_moe_2stage.py):
+                # a16w4 takes the standard GGUU W1, a8w4 the gate/up-
+                # interleaved GUGU one, as in the tuning path.
+                w1_gu = q_dtype_a == dtypes.fp8
+                w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, w1_gu)
+                w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, w1_gu)
+                w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
+                w2_scale_fmoe = shuffle_scale_a16w4(w2_scale, expert, False)
+            elif (
+                q_type == QuantType.per_1x32
+                and q_dtype_a == dtypes.fp4x2
+                and q_dtype_w == dtypes.fp4x2
+            ):
+                # a4w4 (fp4 activation/weight): standard (16,16) weight shuffle
+                # + e8m0 scale shuffle (mirror test_moe_2stage preshuffle path).
+                w1_qt_fmoe = shuffle_weight(w1_qt_fmoe, layout=(16, 16))
+                w2_qt_fmoe = shuffle_weight(w2_qt_fmoe, layout=(16, 16))
+                w1_scale_fmoe = fp4_utils.e8m0_shuffle(w1_scale)
+                w2_scale_fmoe = fp4_utils.e8m0_shuffle(w2_scale)
+            elif (
+                q_type == QuantType.per_1x32
+                and q_dtype_a == dtypes.fp8
+                and q_dtype_w == dtypes.fp8
+            ):
+                # mxfp8 (a8w8): gate-up interleaved fp8 weight; w1 scale uses the
+                # a16w4 interleave, w2 scale uses plain e8m0 (mirror
+                # op_tests/test_moe_2stage.py is_mxfp8).
+                w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
+                w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
+                w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
+                w2_scale_fmoe = fp4_utils.e8m0_shuffle(w2_scale)
+            elif q_dtype_w != dtypes.fp4x2:
+                w1_qt_fmoe = shuffle_weight(w1_qt_fmoe, (16, 16))
+                w2_qt_fmoe = shuffle_weight(w2_qt_fmoe, (16, 16))
+                w1_scale_fmoe = (
+                    fp4_utils.e8m0_shuffle(w1_scale) if w1_scale is not None else None
+                )
+                w2_scale_fmoe = (
+                    fp4_utils.e8m0_shuffle(w2_scale) if w2_scale is not None else None
+                )
+            else:
+                w1_scale_fmoe = (
+                    fp4_utils.e8m0_shuffle(w1_scale) if w1_scale is not None else None
+                )
+                w2_scale_fmoe = (
+                    fp4_utils.e8m0_shuffle(w2_scale) if w2_scale is not None else None
+                )
+
+            w1_qt_fmoe.is_shuffled = True
+            w2_qt_fmoe.is_shuffled = True
+
+            score = torch.randn((token, expert), dtype=dtype, device="cuda")
+            topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
+            if q_type == QuantType.per_1x128:
+                a1_qt, a1_scale = aiter.pertoken_quant(
+                    hidden.view(token, -1, 128), quant_dtype=q_dtype_a
+                )
+                a1_qt = a1_qt.view(token, model_dim)
+                a1_scale = a1_scale.squeeze(-1)
+            elif q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
+                a1_qt = hidden.to(dtypes.bf16)
+                a1_scale = None
+            elif (
+                q_type == QuantType.per_1x32
+                and eff_q_dtype_a in [dtypes.bf16, dtypes.fp16]
+                and q_dtype_w == dtypes.fp4x2
+            ):
+                # a16w4 (bf16 activation): reference runs activation in bf16.
+                a1_qt = hidden.to(dtype)
+                a1_scale = None
+            elif (
+                q_type == QuantType.per_1x32
+                and q_dtype_a == dtypes.fp8
+                and q_dtype_w == dtypes.fp8
+            ):
+                # mxfp8 (a8w8): kernel quantizes the activation internally; the
+                # reference runs activation in bf16 (mirror test_moe_2stage).
+                a1_qt = hidden.to(dtype)
+                a1_scale = None
+            else:
+                # Use the *effective* activation dtype (what fused_moe runs),
+                # not the config's nominal q_dtype_a. For Silu+SEPARATED fp4
+                # weights this is fp4x2 (a4w4), so the reference quantizes the
+                # activation to fp4 to match the kernel.
+                torch_quant = aiter.get_torch_quant(q_type)
+                a1_qt, a1_scale = torch_quant(hidden, quant_dtype=eff_q_dtype_a)
+
+            out, us = run_perftest(
+                target_fused_moe,
+                hidden,
+                w1_qt_fmoe,
+                w2_qt_fmoe,
+                topk_weights,
+                topk_ids,
+                activation=act_type,
+                quant_type=q_type,
+                doweight_stage1=doweight_stage1,
+                # The torch reference runs SiTUv2 with the model's betas;
+                # fused_moe defaults to 1.0. Without this every Situv2 shape
+                # reports logits_diff ~0.14 (out_norm/ref_norm ~0.61)
+                # regardless of which kernel it dispatched.
+                beta=(
+                    DEFAULT_SITUV2_BETA if act_type == ActivationType.Situv2 else None
+                ),
+                linear_beta=(
+                    DEFAULT_SITUV2_LINEAR_BETA
+                    if act_type == ActivationType.Situv2
+                    else None
+                ),
+                swiglu_limit=swiglu_limit,
+                w1_scale=w1_scale_fmoe,
+                w2_scale=w2_scale_fmoe,
+                dtype=dtype,
+                num_warmup=args.warmup,
+                num_iters=args.iters,
+            )
+            # a16wi4: per_1x32_i4_quant stores int4 in an int8 container.
+            # The torch reference detects int4 weights by the i4x2 dtype, so
+            # pass an i4x2-reinterpreted view to the reference only (the kernel
+            # path above consumes the int8 w*_qt). Mirrors op_tests/test_moe_2stage.py.
+            w1_qt_ref, w2_qt_ref = w1_qt, w2_qt
+            if q_type == QuantType.per_1x32 and w1_qt.dtype == dtypes.i8:
+                w1_qt_ref = w1_qt.view(dtypes.i4x2)
+                w2_qt_ref = w2_qt.view(dtypes.i4x2)
+            ref = self.torch_moe_2stages(
+                a1_qt,
+                w1_qt_ref,
+                w2_qt_ref,
+                topk_weights,
+                topk_ids,
+                a1_scale=a1_scale,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                dtype=dtype,
+                activation=act_type,
+                quant_type=q_type,
+                doweight_stage1=doweight_stage1,
+                swiglu_limit=swiglu_limit,
+            )
+            if not _all_finite(out) or not _all_finite(ref):
+                diag = tensor_compare_diagnostics(ref, out)
+                status = f"error:nonfinite output or reference; {diag}"
+                err_ratio = 1.0
+            elif out.count_nonzero() == 0 and ref.count_nonzero() > 0:
+                diag = tensor_compare_diagnostics(ref, out)
+                status = (
+                    f"error:output is all zeros (kernel produced no output); {diag}"
+                )
+                err_ratio = 1.0
+            else:
+                err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
+                # Element-wise err_ratio (atol/rtol) is overly strict for lossy
+                # fp4/fp8 MoE: even a correct kernel differs on most elements
+                # vs the higher-precision reference. op_tests/test_moe_2stage.py
+                # judges these paths by cosine similarity (logits_diff) instead,
+                # so accept a shape if either metric passes. A genuinely wrong
+                # (uncorrelated) kernel still has large logits_diff and fails.
+                _x = out.to(dtypes.fp32)
+                _y = ref.to(dtypes.fp32)
+                _den = (_x * _x + _y * _y).sum()
+                logits_diff = (
+                    float(1.0 - (2.0 * (_x * _y).sum() / _den).item())
+                    if _den.item() != 0
+                    else 0.0
+                )
+                cos_tol = float(os.environ.get("AITER_RUN_CONFIG_COS_TOL", "0.01"))
+                if err_ratio <= allowed_err_ratio or logits_diff <= cos_tol:
+                    status = "ok"
+                else:
                     diag = tensor_compare_diagnostics(ref, out)
                     status = (
-                        "error:output is all zeros (kernel produced no output); "
-                        f"{diag}"
+                        f"mismatch:err_ratio={err_ratio:.6g}"
+                        f"(>{allowed_err_ratio_desc}),"
+                        f"logits_diff={logits_diff:.6g}(>{cos_tol}),"
+                        f"diagnostics={diag}"
                     )
-                    err_ratio = 1.0
-                else:
-                    err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
-                    # Element-wise err_ratio (atol/rtol) is overly strict for lossy
-                    # fp4/fp8 MoE: even a correct kernel differs on most elements
-                    # vs the higher-precision reference. op_tests/test_moe_2stage.py
-                    # judges these paths by cosine similarity (logits_diff) instead,
-                    # so accept a shape if either metric passes. A genuinely wrong
-                    # (uncorrelated) kernel still has large logits_diff and fails.
-                    _x = out.to(dtypes.fp32)
-                    _y = ref.to(dtypes.fp32)
-                    _den = (_x * _x + _y * _y).sum()
-                    logits_diff = (
-                        float(1.0 - (2.0 * (_x * _y).sum() / _den).item())
-                        if _den.item() != 0
-                        else 0.0
-                    )
-                    cos_tol = float(os.environ.get("AITER_RUN_CONFIG_COS_TOL", "0.01"))
-                    if err_ratio <= allowed_err_ratio or logits_diff <= cos_tol:
-                        status = "ok"
-                    else:
-                        diag = tensor_compare_diagnostics(ref, out)
-                        status = (
-                            f"mismatch:err_ratio={err_ratio:.6g}"
-                            f"(>{allowed_err_ratio_desc}),"
-                            f"logits_diff={logits_diff:.6g}(>{cos_tol}),"
-                            f"diagnostics={diag}"
-                        )
-                results.append(
-                    {
-                        "shape": shape_str,
-                        "e2e_us": us,
-                        "kernel_us": kernel_us,
-                        "status": status,
-                        "err_ratio": err_ratio,
-                    }
-                )
-            except AssertionError as e:
-                # checkAllclose raises on catastrophic error (max_delta exceeds threshold).
-                # Demote to mismatch only when err_ratio also exceeds allowed_err_ratio,
-                # i.e. it is genuinely a precision issue. Otherwise keep as error so that
-                # rare outliers (e.g. a few NaN/zeros) are not silently swept under mismatch.
-                msg = str(e)
-                if "catastrophic" in msg:
-                    import re
+            return {
+                "shape": shape_str,
+                "e2e_us": us,
+                "kernel_us": kernel_us,
+                "status": status,
+                "err_ratio": err_ratio,
+            }
+        except AssertionError as e:
+            # checkAllclose raises on catastrophic error (max_delta exceeds threshold).
+            # Demote to mismatch only when err_ratio also exceeds allowed_err_ratio,
+            # i.e. it is genuinely a precision issue. Otherwise keep as error so that
+            # rare outliers (e.g. a few NaN/zeros) are not silently swept under mismatch.
+            msg = str(e)
+            if "catastrophic" in msg:
+                import re
 
-                    m = re.search(r"(\d+\.\d+)%", msg)
-                    err_ratio = float(m.group(1)) / 100 if m else 1.0
-                    if err_ratio > allowed_err_ratio:
-                        results.append(
-                            {
-                                "shape": shape_str,
-                                "e2e_us": us if "us" in locals() else -1,
-                                "kernel_us": kernel_us,
-                                "status": (
-                                    f"mismatch:catastrophic err_ratio={err_ratio:.6g}"
-                                    f"(>{allowed_err_ratio_desc})"
-                                ),
-                            }
-                        )
-                    else:
-                        results.append(
-                            {
-                                "shape": shape_str,
-                                "e2e_us": -1,
-                                "kernel_us": kernel_us,
-                                "status": f"error:{e}",
-                            }
-                        )
+                m = re.search(r"(\d+\.\d+)%", msg)
+                err_ratio = float(m.group(1)) / 100 if m else 1.0
+                if err_ratio > allowed_err_ratio:
+                    return {
+                        "shape": shape_str,
+                        "e2e_us": us if "us" in locals() else -1,
+                        "kernel_us": kernel_us,
+                        "status": (
+                            f"mismatch:catastrophic err_ratio={err_ratio:.6g}"
+                            f"(>{allowed_err_ratio_desc})"
+                        ),
+                    }
                 else:
-                    results.append(
-                        {
-                            "shape": shape_str,
-                            "e2e_us": -1,
-                            "kernel_us": kernel_us,
-                            "status": f"error:{e}",
-                        }
-                    )
-            except Exception as e:  # noqa: BLE001
-                results.append(
-                    {
+                    return {
                         "shape": shape_str,
                         "e2e_us": -1,
                         "kernel_us": kernel_us,
                         "status": f"error:{e}",
                     }
-                )
-            finally:
-                torch.cuda.empty_cache()
-        return results
+            else:
+                return {
+                    "shape": shape_str,
+                    "e2e_us": -1,
+                    "kernel_us": kernel_us,
+                    "status": f"error:{e}",
+                }
+        except Exception as e:  # noqa: BLE001
+            return {
+                "shape": shape_str,
+                "e2e_us": -1,
+                "kernel_us": kernel_us,
+                "status": f"error:{e}",
+            }
+        finally:
+            torch.cuda.empty_cache()
 
     def tune(
         self,

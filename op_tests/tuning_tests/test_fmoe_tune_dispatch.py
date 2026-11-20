@@ -897,6 +897,22 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         )
         self.assertEqual(separated["kernelName1"], "grouped_gemm1_a8w4_gguu")
 
+    def test_run_config_runs_each_row_through_run_config_row(self):
+        self.tuner.untunedf = pd.concat(
+            [self.untuned(token=1), self.untuned(token=4)], ignore_index=True
+        )
+        operator = object()
+        seen = []
+
+        def run_row(row, target_fused_moe, args):
+            seen.append((int(row["token"]), target_fused_moe, args))
+            return {"token": int(row["token"])}
+
+        with mock.patch.object(self.tuner, "run_config_row", side_effect=run_row):
+            results = self.tuner.run_config(self.args, target_fused_moe=operator)
+        self.assertEqual(results, [{"token": 1}, {"token": 4}])
+        self.assertEqual(seen, [(1, operator, self.args), (4, operator, self.args)])
+
     def test_grouped_tune_skips_invalid_times(self):
         tuner = self.gemm_moe_tune.GroupedFmoeTuner(
             "groupedFmoe", KEYS, ["kernelName1", "us"], "grouped"
