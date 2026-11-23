@@ -143,17 +143,12 @@ def _cleanup_stale_lock_files():
 
 def _child_script(token):
     return textwrap.dedent(f"""\
-        import sys
-        sys.path.insert(
-            0,
-            {os.path.join(AITER_ROOT, "csrc", "ck_gemm_moe_2stages_codegen")!r},
-        )
         import torch
         from aiter import ActivationType, QuantType, dtypes
         from aiter.fused_moe import fused_moe
         from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
         from aiter.ops.flydsl.moe_common import GateMode
-        from fhmoe_tune import FhmoeTuner
+        from aiter.tuning.moe.fhmoe import FhmoeTuner
 
         shape = {{
             "gfx": get_gfx_runtime(),

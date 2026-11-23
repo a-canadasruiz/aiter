@@ -26,7 +26,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |
 | `test_asm_splitk_guard.py` | 1 | No | `GemmTuner.asm_gemm_all_solutions` SplitK semaphore grid guard |
 | `test_run_config.py` | 2 | Yes | Run --run_config on ALL existing tuned CSVs (configs + model_configs) |
-| `test_fhmoe_dsv4_tuner.py` | 1 | No | `FhmoeTuner` (`fhmoe_tune.py`): token buckets, kernel pairs, `post_process`, CSV rewrite, gfx/cu_num guard on the untuned catalogue |
+| `test_fhmoe_dsv4_tuner.py` | 1 | No | `FhmoeTuner` (`aiter/tuning/moe/fhmoe.py`): token buckets, kernel pairs, `post_process`, CSV rewrite, gfx/cu_num guard on the untuned catalogue |
 | `test_fhmoe_replay.py` | 2 | Yes | `FhmoeTuner` output replayed through the public `fused_moe` in a fresh process (gfx950). Not run by any workflow job |
 
 ## CI coverage

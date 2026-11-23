@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""CPU-only tests for FhmoeTuner (fhmoe_tune.py).
+"""CPU-only tests for FhmoeTuner (aiter/tuning/moe/fhmoe.py).
 
 Level 1: no GPU. The GPU identity the tuner reads (gfx, cu_num) is mocked, and
 the kernel search is never dispatched.
@@ -29,7 +29,7 @@ CONFIGS_DIR = REPO_ROOT / "aiter" / "configs"
 UNTUNED_CSV = CONFIGS_DIR / "untuned_fhmoe.csv"
 TUNED_CSV = CONFIGS_DIR / "tuned_fhmoe.csv"
 
-# Mirrors key / resultList in the __main__ block of fhmoe_tune.py;
+# Mirrors key / resultList in main() of aiter/tuning/moe/fhmoe.py;
 # test_columns_match_shipped_tuned_header fails if the column set drifts from the CSV.
 KEYS = [
     "gfx",
@@ -56,9 +56,9 @@ LDS_BYTES = 160 * 1024
 
 
 def _tune_module():
-    from csrc.ck_gemm_moe_2stages_codegen import fhmoe_tune
+    from aiter.tuning.moe import fhmoe
 
-    return fhmoe_tune
+    return fhmoe
 
 
 def _quiet():
