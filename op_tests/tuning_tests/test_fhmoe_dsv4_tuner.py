@@ -79,8 +79,30 @@ def _shape(token=1):
     return _tune_module().FhmoeTuner._parse_fhmoe_row(row)
 
 
+def _hy4_catalogue():
+    tuned = pd.read_csv(TUNED_CSV)
+    hy4 = (
+        (tuned["q_dtype_w"] == "torch.float8_e4m3fn")
+        & (tuned["model_dim"] == 6144)
+        & (tuned["inter_dim"] == 256)
+    )
+    return tuned[hy4].reset_index(drop=True)
+
+
+def _hy4_shape(token=1):
+    row = _hy4_catalogue().iloc[0].copy()
+    row["token"] = token
+    return _tune_module().FhmoeTuner._parse_fhmoe_row(row)
+
+
 def _tune_args(**overrides):
-    args = {"warmup": 1, "iters": 1, "profile_file": "", "errRatio": 0.05}
+    args = {
+        "warmup": 1,
+        "iters": 1,
+        "profile_file": "",
+        "errRatio": 0.05,
+        "swiglu_limit": None,
+    }
     args.update(overrides)
     return SimpleNamespace(**args)
 
@@ -151,6 +173,40 @@ class TestFhmoeTuneTasks(unittest.TestCase):
         self.assertEqual(in_datas, [(len(pairs), ())] * len(df))
         self.assertEqual({task[0][0][2] for task in tasks}, set(df["token"]))
 
+    def _tasks(self, df, **args):
+        with (
+            mock.patch.object(
+                _tune_module().FhmoeTuner,
+                "_kernel_pairs",
+                return_value=[(32, "k1", "k2")],
+            ),
+            _quiet(),
+        ):
+            return _tuner()._fhmoe_tune_tasks(df, _tune_args(**args))[0]
+
+    def test_token_past_the_reduce_buffer_limit_is_rejected(self):
+        df = _catalogue().iloc[:1].copy()
+        df["token"] = 131072
+        with (
+            mock.patch.object(
+                _tune_module().FhmoeTuner,
+                "_kernel_pairs",
+                side_effect=AssertionError("pairs built past the buffer limit"),
+            ),
+            self.assertRaisesRegex(ValueError, "32-bit addressing"),
+        ):
+            _tuner()._fhmoe_tune_tasks(df, _tune_args())
+
+    def test_largest_hy4_bucket_fits_the_reduce_buffer(self):
+        df = _hy4_catalogue()
+        self.assertEqual(len(self._tasks(df[df["token"] == 32768])), 1)
+
+    def test_tasks_carry_the_normalized_swiglu_limit(self):
+        for limit, expected in ((None, None), (0.0, None), (10.0, 10.0)):
+            with self.subTest(limit=limit):
+                (task,) = self._tasks(_catalogue().iloc[:1], swiglu_limit=limit)
+                self.assertEqual(task[2][0]["swiglu_limit"], expected)
+
     def test_every_task_judges_against_the_closest_reference(self):
         mod = _tune_module()
         pairs = [(16, "k1a_fp8", "k2a"), (16, "k1a", "k2a")]
@@ -210,22 +266,18 @@ class TestFhmoeReferences(unittest.TestCase):
         self.assertEqual(compare(refs[:1], res, printLog=False), 2.0)
 
 
-class TestFhmoeOwnedRows(unittest.TestCase):
-    def test_only_mxfp4_weight_rows_are_kept(self):
-        df = pd.DataFrame(
-            {
-                "token": [1, 2, 4],
-                "q_dtype_w": [
-                    "torch.float4_e2m1fn_x2",
-                    "torch.float8_e4m3fn",
-                    "torch.float4_e2m1fn_x2",
-                ],
-            }
+class TestFhmoeTuneRows(unittest.TestCase):
+    def test_mxfp4_and_mxfp8_weight_rows_are_both_tuned(self):
+        catalogue = _catalogue()
+        df = pd.concat(
+            [catalogue.iloc[:1], _hy4_catalogue()[catalogue.columns].iloc[:1]],
+            ignore_index=True,
         )
-        with _quiet():
-            owned = _tune_module().FhmoeTuner._owned_rows(df)
-        self.assertEqual(owned["token"].tolist(), [1, 4])
-        self.assertEqual(owned.index.tolist(), [0, 1])
+        with mock.patch.object(
+            _tune_module().FhmoeTuner, "_fhmoe_tune_tasks", return_value=([], [])
+        ) as tune_tasks:
+            self.assertEqual(_tuner().tune(df, None, _tune_args()), [])
+        pd.testing.assert_frame_equal(tune_tasks.call_args.args[0], df)
 
 
 class TestFhmoeKernelPairs(unittest.TestCase):
@@ -282,6 +334,109 @@ class TestFhmoeKernelPairs(unittest.TestCase):
         self.assertEqual(self._catalog_args(shape), (("fp8", "fp4", "bf16"),) * 2)
         fp4_a = dict(shape, q_dtype_a=dtypes.fp4x2)
         self.assertEqual(self._catalog_args(fp4_a), (("fp4", "fp4", "bf16"),) * 2)
+        fp8_w = dict(shape, q_dtype_w=dtypes.fp8)
+        self.assertEqual(self._catalog_args(fp8_w), (("fp8", "fp8", "bf16"),) * 2)
+
+
+class TestFhmoeMxfp8KernelPairs(unittest.TestCase):
+    """MXFP8 routed rows keep the search of op_tests/tuners/tune_fhmoe.py."""
+
+    def _pairs(self, shape):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("TUNE_MOE_KERNEL_REGEX", None)
+            return _tune_module().FhmoeTuner._kernel_pairs(shape)
+
+    def test_pairs_follow_the_hy4_cuts(self):
+        mod = _tune_module()
+        shape = _hy4_shape()
+        pairs = self._pairs(shape)
+        self.assertTrue(pairs)
+        self.assertEqual(len(pairs), len(set(pairs)), "duplicate pairs")
+        s1_all = mod.get_flydsl_stage1_kernels("fp8", "fp8", "bf16")
+        s2_all = mod.get_flydsl_stage2_kernels("fp8", "fp8", "bf16")
+        for block_m, kn1, kn2 in pairs:
+            self.assertTrue(kn1.endswith("_fp8"), kn1)
+            p1 = s1_all[kn1[: -len("_fp8")]]
+            self.assertEqual(p1["tile_m"], block_m, kn1)
+            self.assertEqual(p1["tile_k"], 256, kn1)
+            self.assertEqual(shape["inter_dim"] % p1["tile_n"], 0, kn1)
+            self.assertEqual(p1.get("k_batch", 1), 1, kn1)
+            self.assertEqual(p1["gate_mode"], "interleave", kn1)
+            base2 = kn2.removesuffix(f"_sbm{block_m}")
+            p2 = s2_all[base2]
+            self.assertEqual(block_m % p2["tile_m"], 0, kn2)
+            self.assertEqual(base2 != kn2, p2["tile_m"] < block_m, kn2)
+            self.assertEqual(shape["inter_dim"] % p2["tile_k"], 0, kn2)
+            self.assertEqual(p2["tile_n"], 128, kn2)
+            self.assertFalse(p2.get("persist", False), kn2)
+            self.assertEqual(p2.get("b_nt", 0), 0, kn2)
+
+    def test_pairs_cover_every_shipped_hy4_row(self):
+        hy4 = _hy4_catalogue()
+        self.assertEqual(len(hy4), 16)
+        pairs = set(self._pairs(_hy4_shape()))
+        for _, row in hy4.iterrows():
+            with self.subTest(token=row["token"]):
+                self.assertIn(
+                    (int(row["block_m"]), row["kernelName1"], row["kernelName2"]),
+                    pairs,
+                )
+
+
+class TestFhmoeSwigluLimit(unittest.TestCase):
+    """The limit reaches the launch and the reference; aiter.fhmoe leaves the
+    shared expert unclamped only on MXFP8 routed rows."""
+
+    def _shape(self, q_dtype_w):
+        return dict(_shape(), q_dtype_w=q_dtype_w, swiglu_limit=10.0)
+
+    def test_clamp_shared_follows_the_routed_weight_dtype(self):
+        mod = _tune_module()
+        self.assertTrue(mod.FhmoeTuner._clamp_shared(self._shape(mod.dtypes.fp4x2)))
+        self.assertFalse(mod.FhmoeTuner._clamp_shared(self._shape(mod.dtypes.fp8)))
+
+    def test_launch_gets_the_limit_and_the_shared_clamp(self):
+        mod = _tune_module()
+        data = {key: torch.zeros(1) for key in mod.FhmoeTuner._FHMOE_MP_DATA_KEYS}
+        data["shared_expert_id"] = 384
+        for q_dtype_w, clamp_shared in (
+            (mod.dtypes.fp4x2, True),
+            (mod.dtypes.fp8, False),
+        ):
+            with (
+                self.subTest(q_dtype_w=q_dtype_w),
+                mock.patch.object(mod, "_fused_moe_impl") as launch,
+            ):
+                mod.FhmoeTuner._run_fhmoe(self._shape(q_dtype_w), data, "k1", "k2", 32)
+                kwargs = launch.call_args.kwargs
+                self.assertEqual(kwargs["swiglu_limit"], 10.0)
+                stage1 = kwargs["_stage1_extra_args"]
+                self.assertEqual(stage1["swiglu_limit"], 10.0)
+                self.assertEqual(stage1["clamp_shared"], clamp_shared)
+
+    def test_reference_clamps_the_shared_expert_like_the_launch(self):
+        mod = _tune_module()
+        topk_ids = torch.zeros((2, 7), dtype=torch.int32)
+        topk_weights = torch.ones((2, 7))
+        for q_dtype_w, shared_limit in (
+            (mod.dtypes.fp4x2, 10.0),
+            (mod.dtypes.fp8, None),
+        ):
+            shape = dict(self._shape(q_dtype_w), q_dtype_a=mod.dtypes.fp4x2)
+            with (
+                self.subTest(q_dtype_w=q_dtype_w),
+                mock.patch.object(
+                    mod, "run_torch_moe_stage1", return_value=torch.zeros(1)
+                ) as stage1,
+                mock.patch.object(
+                    mod, "run_torch_moe_stage2", return_value=torch.zeros(1)
+                ),
+            ):
+                mod.FhmoeTuner.run_torch_fhmoe(
+                    *[None] * 9, topk_weights, topk_ids, shape
+                )
+                limits = [call.kwargs["swiglu_limit"] for call in stage1.call_args_list]
+                self.assertEqual(limits, [10.0, shared_limit])
 
 
 class TestFhmoePadDummyExpert(unittest.TestCase):

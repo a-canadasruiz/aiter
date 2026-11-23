@@ -15,6 +15,7 @@ import torch
 import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fhmoe import _is_dsv4_i384_fhmoe_contract, _use_fhmoe_wrappers
+from aiter.fhmoe_contract import max_fhmoe_reduce_tokens
 from aiter.fused_moe import (
     _fused_moe_impl,
     fused_moe,
@@ -29,6 +30,7 @@ from aiter.ops.flydsl.moe_kernels import (
     get_flydsl_stage1_kernels,
     get_flydsl_stage2_kernels,
 )
+from aiter.ops.moe_limits import normalize_swiglu_limit
 from aiter.ops.shuffle import (
     shuffle_scale,
     shuffle_scale_a16w4,
@@ -62,7 +64,14 @@ class FhmoeTuner(TunerCommon):
     }
 
     def _setup_specific_arguments(self):
-        pass
+        self.parser.add_argument(
+            "--swiglu_limit",
+            type=float,
+            default=None,
+            help="SiLU gate/up clamp used while timing and in the reference "
+            "(HY4 serves with 10). The CSV has no column for it, so tune every "
+            "row of one tuned file with the same limit.",
+        )
 
     def _clear_op_caches(self):
         import aiter.fused_moe as fmoe_module
@@ -124,22 +133,6 @@ class FhmoeTuner(TunerCommon):
             if col in df.columns:
                 df[col] = value
         return df
-
-    # _kernel_pairs only builds MXFP4-weight pairs; tuned_fhmoe.csv also holds
-    # HY4 FP8-weight rows owned by op_tests/tuners/tune_fhmoe.py.
-    _OWNED_Q_DTYPE_W = "torch.float4_e2m1fn_x2"
-
-    @classmethod
-    def _owned_rows(cls, df):
-        owned = df["q_dtype_w"].astype(str) == cls._OWNED_Q_DTYPE_W
-        skipped = int((~owned).sum())
-        if skipped:
-            print(
-                f"[fhmoe] skipping {skipped} non-MXFP4-weight rows "
-                "(tuned by op_tests/tuners/tune_fhmoe.py)",
-                flush=True,
-            )
-        return df[owned].reset_index(drop=True)
 
     @staticmethod
     def _parse_fhmoe_row(row):
@@ -388,46 +381,12 @@ class FhmoeTuner(TunerCommon):
         s2_all = get_flydsl_stage2_kernels(a_dtype, b_dtype, out_dtype)
         pairs = []
         for block_m in FhmoeTuner.BLOCK_MS:
-            s1_names = []
-            for kname, kparams in s1_all.items():
-                if kparams.get("tile_m") != block_m:
-                    continue
-                k_batch = kparams.get("k_batch", 1)
-                k_wave = kparams.get("k_wave", 1)
-                tile_k = kparams["tile_k"]
-                # Same stage1 k_batch cut as backends.flydsl.gen_flydsl_2stages_task:
-                # drop splits that do not divide K.
-                if model_dim % k_batch != 0:
-                    continue
-                k_per_batch = model_dim // k_batch
-                if k_per_batch % tile_k != 0:
-                    continue
-                if k_wave > 1 and (
-                    k_per_batch % k_wave != 0 or (k_per_batch // k_wave) % tile_k != 0
-                ):
-                    continue
-                # Trailing _fp8/_fp4: fused_moe fuses inter-stage quant into
-                # stage1; bare kname: quant after. Same as FmoeTuner.
-                fused = kname + ("_fp8" if a_dtype == "fp8" else "_fp4")
-                if k_batch > 1:
-                    s1_names.append(fused)
-                else:
-                    s1_names.extend((kname, fused))
-            s2_names = []
-            for kname, kparams in s2_all.items():
-                if kparams.get("tile_m") != block_m:
-                    continue
-                # Same stage2 cuts as backends.flydsl.gen_flydsl_2stages_task:
-                #  - tile_k must divide inter_dim (K); tile_k=256 on non-256 inter
-                #    (e.g. 384) is parsed verbatim by the wrapper -> OOB/wrong out;
-                #  - LDS is tile_m*(tile_k*2 + tile_n*4); over 160 KiB (gfx950
-                #    workgroup LDS) the build fails.
-                if inter_dim % kparams["tile_k"] != 0:
-                    continue
-                lds = block_m * (kparams["tile_k"] * 2 + kparams["tile_n"] * 4)
-                if lds > 160 * 1024:
-                    continue
-                s2_names.append(kname)
+            if b_dtype == "fp8":
+                s1_names = FhmoeTuner._mxfp8_stage1_names(s1_all, block_m, inter_dim)
+                s2_names = FhmoeTuner._mxfp8_stage2_names(s2_all, block_m, inter_dim)
+            else:
+                s1_names = FhmoeTuner._stage1_names(s1_all, block_m, model_dim, a_dtype)
+                s2_names = FhmoeTuner._stage2_names(s2_all, block_m, inter_dim)
             for kn1 in s1_names:
                 for kn2 in s2_names:
                     pairs.append((block_m, kn1, kn2))
@@ -436,6 +395,89 @@ class FhmoeTuner(TunerCommon):
             pattern = re.compile(kernel_regex)
             pairs = [p for p in pairs if pattern.search(f"{p[1]} {p[2]}")]
         return pairs
+
+    @staticmethod
+    def _stage1_names(s1_all, block_m, model_dim, a_dtype):
+        names = []
+        for kname, kparams in s1_all.items():
+            if kparams.get("tile_m") != block_m:
+                continue
+            k_batch = kparams.get("k_batch", 1)
+            k_wave = kparams.get("k_wave", 1)
+            tile_k = kparams["tile_k"]
+            # Same stage1 k_batch cut as backends.flydsl.gen_flydsl_2stages_task:
+            # drop splits that do not divide K.
+            if model_dim % k_batch != 0:
+                continue
+            k_per_batch = model_dim // k_batch
+            if k_per_batch % tile_k != 0:
+                continue
+            if k_wave > 1 and (
+                k_per_batch % k_wave != 0 or (k_per_batch // k_wave) % tile_k != 0
+            ):
+                continue
+            # Trailing _fp8/_fp4: fused_moe fuses inter-stage quant into
+            # stage1; bare kname: quant after. Same as FmoeTuner.
+            fused = kname + ("_fp8" if a_dtype == "fp8" else "_fp4")
+            if k_batch > 1:
+                names.append(fused)
+            else:
+                names.extend((kname, fused))
+        return names
+
+    @staticmethod
+    def _stage2_names(s2_all, block_m, inter_dim):
+        names = []
+        for kname, kparams in s2_all.items():
+            if kparams.get("tile_m") != block_m:
+                continue
+            # Same stage2 cuts as backends.flydsl.gen_flydsl_2stages_task:
+            #  - tile_k must divide inter_dim (K); tile_k=256 on non-256 inter
+            #    (e.g. 384) is parsed verbatim by the wrapper -> OOB/wrong out;
+            #  - LDS is tile_m*(tile_k*2 + tile_n*4); over 160 KiB (gfx950
+            #    workgroup LDS) the build fails.
+            if inter_dim % kparams["tile_k"] != 0:
+                continue
+            lds = block_m * (kparams["tile_k"] * 2 + kparams["tile_n"] * 4)
+            if lds > 160 * 1024:
+                continue
+            names.append(kname)
+        return names
+
+    # MXFP8 routed rows keep the search of the HY4 tuner that first tuned them
+    # (op_tests/tuners/tune_fhmoe.py), with its inter_dim=256 literals read as
+    # inter_dim.
+    @staticmethod
+    def _mxfp8_stage1_names(s1_all, block_m, inter_dim):
+        names = []
+        for kname, kparams in s1_all.items():
+            if (
+                kparams["tile_m"] != block_m
+                or kparams["tile_k"] != 256
+                or inter_dim % kparams["tile_n"] != 0
+                or kparams.get("k_batch", 1) != 1
+                or kparams.get("gate_mode") != "interleave"
+            ):
+                continue
+            names.append(f"{kname}_fp8")
+        return names
+
+    @staticmethod
+    def _mxfp8_stage2_names(s2_all, block_m, inter_dim):
+        names = []
+        for kname, kparams in s2_all.items():
+            tile_m = kparams["tile_m"]
+            if (
+                block_m % tile_m != 0
+                or inter_dim % kparams["tile_k"] != 0
+                or kparams["tile_n"] != 128
+                or kparams.get("persist") is True
+                or kparams.get("b_nt", 0) != 0
+            ):
+                continue
+            # A smaller stage-2 tile reads the block_m sort through _sbm.
+            names.append(kname if tile_m == block_m else f"{kname}_sbm{block_m}")
+        return names
 
     @staticmethod
     def _lookup_token(token):
@@ -473,11 +515,18 @@ class FhmoeTuner(TunerCommon):
         pd.DataFrame([row]).to_csv(path, index=False)
 
     @staticmethod
+    def _clamp_shared(shape):
+        # aiter.fhmoe leaves the shared expert unclamped only with MXFP8 routed
+        # weights, which is how HY4 serves; MXFP4 rows must keep it clamped.
+        return shape["q_dtype_w"] != dtypes.fp8
+
+    @staticmethod
     def _run_fhmoe(shape, data, kn1, kn2, block_m):
         gate_mode = shape["gate_mode"]
         if not isinstance(gate_mode, str):
             gate_mode = gate_mode.value
         q_dtype_a = shape["q_dtype_a"]
+        swiglu_limit = shape.get("swiglu_limit")
         to_dev = FhmoeTuner._to_ref_device
 
         w1 = to_dev(data["w1"])
@@ -505,6 +554,7 @@ class FhmoeTuner(TunerCommon):
                 dtype=shape["dtype"],
                 hidden_pad=shape["hidden_pad"],
                 intermediate_pad=shape["intermediate_pad"],
+                swiglu_limit=swiglu_limit,
                 gate_mode=gate_mode,
                 _q_dtype_a=q_dtype_a,
                 _metadata_transform=_use_fhmoe_wrappers,
@@ -513,6 +563,8 @@ class FhmoeTuner(TunerCommon):
                     "shared_w1": to_dev(data["shared_w1"]),
                     "shared_w1_scale": to_dev(data["shared_w1_scale"]),
                     "shared_expert_id": data["shared_expert_id"],
+                    "swiglu_limit": swiglu_limit,
+                    "clamp_shared": FhmoeTuner._clamp_shared(shape),
                 },
                 _stage2_extra_args={
                     "shared_w2": to_dev(data["shared_w2"]),
@@ -618,12 +670,12 @@ class FhmoeTuner(TunerCommon):
     ):
         """Homogeneous torch refs for routed experts and shared FP8, then summed.
 
-        Matches the tuner launch: same tensors, no swiglu_limit (the candidate
-        path does not pass one). Rows whose q_dtype_a is MXFP8 quantize the
-        hidden states and the stage-1 result to MXFP8, so the reference does
-        too. A fused-quant stage 1 (kernelName1 ending in _fp8) quantizes its
-        fp32 result; the unfused path quantizes it after rounding to dtype.
-        Other activation dtypes are not modeled; they keep bf16.
+        Matches the tuner launch: same tensors and swiglu_limit, with the shared
+        expert clamped only when the launch clamps it. Rows whose q_dtype_a is
+        MXFP8 quantize the hidden states and the stage-1 result to MXFP8, so the
+        reference does too. A fused-quant stage 1 (kernelName1 ending in _fp8)
+        quantizes its fp32 result; the unfused path quantizes it after rounding
+        to dtype. Other activation dtypes are not modeled; they keep bf16.
         """
         hidden = FhmoeTuner._to_ref_device(hidden)
         w1_qt = FhmoeTuner._to_ref_device(w1_qt)
@@ -649,6 +701,8 @@ class FhmoeTuner(TunerCommon):
         activation = shape["act_type"]
         quant_type = shape["q_type"]
         doweight_stage1 = bool(shape["doweight_stage1"])
+        swiglu_limit = shape.get("swiglu_limit")
+        shared_swiglu_limit = swiglu_limit if FhmoeTuner._clamp_shared(shape) else None
         quantize_mxfp8 = shape["q_dtype_a"] == dtypes.fp8
         stage1_dtype = dtypes.fp32 if quantize_mxfp8 and quantize_fp32 else dtype
 
@@ -676,6 +730,7 @@ class FhmoeTuner(TunerCommon):
             quant_type=quant_type,
             doweight_stage1=doweight_stage1,
             topk=routed_ids.shape[1],
+            swiglu_limit=swiglu_limit,
         )
         a2, a2_scale = quantize_a2(ref1)
         routed = run_torch_moe_stage2(
@@ -703,6 +758,7 @@ class FhmoeTuner(TunerCommon):
             quant_type=quant_type,
             doweight_stage1=doweight_stage1,
             topk=1,
+            swiglu_limit=shared_swiglu_limit,
         )
         shared_a2, shared_a2_scale = quantize_a2(shared_ref1)
         shared = run_torch_moe_stage2(
@@ -747,11 +803,22 @@ class FhmoeTuner(TunerCommon):
         in_datas = []
         for _, row in untunedf.iterrows():
             shape = self._parse_fhmoe_row(row)
+            shape["swiglu_limit"] = normalize_swiglu_limit(args.swiglu_limit)
             padded = self._lookup_token(shape["token"])
             if padded != shape["token"]:
                 raise ValueError(
                     f"FHMoE token {shape['token']} is not a serving bucket "
                     f"(get_padded_M -> {padded}); use power-of-two tokens"
+                )
+            max_tokens = max_fhmoe_reduce_tokens(
+                shape["topk"],
+                shape["model_dim"],
+                torch.empty((), dtype=shape["dtype"]).element_size(),
+            )
+            if shape["token"] > max_tokens:
+                raise ValueError(
+                    f"FHMoE token {shape['token']} exceeds {max_tokens}, the "
+                    "largest M whose stage-2 reduce buffer fits 32-bit addressing"
                 )
             self._check_served_contract(shape)
             info = tuple(shape[k] for k in self.keys)
@@ -789,8 +856,9 @@ class FhmoeTuner(TunerCommon):
         from aiter.test_common import run_perftest
 
         results = []
-        for _, row in self._owned_rows(self.untunedf).iterrows():
+        for _, row in self.untunedf.iterrows():
             shape = self._parse_fhmoe_row(row)
+            shape["swiglu_limit"] = normalize_swiglu_limit(args.swiglu_limit)
             shape_str = (
                 f"(token={shape['token']}, dim={shape['model_dim']}, "
                 f"inter={shape['inter_dim']}, E={shape['expert']}, "
@@ -814,10 +882,13 @@ class FhmoeTuner(TunerCommon):
                     kernel_us = None
             try:
                 data = self.generate_fhmoe_data(shape)
-                w1 = self._to_ref_device(data["w1"])
-                w2 = self._to_ref_device(data["w2"])
-                w1.is_shuffled = True
-                w2.is_shuffled = True
+                w1, w2, shared_w1, shared_w2 = (
+                    self._to_ref_device(data[name])
+                    for name in ("w1", "w2", "shared_w1", "shared_w2")
+                )
+                # Public fused_moe rejects MXFP8 rows unless all four carry the marker.
+                for weight in (w1, w2, shared_w1, shared_w2):
+                    weight.is_shuffled = True
                 gate_mode = shape["gate_mode"]
                 if not isinstance(gate_mode, str):
                     gate_mode = gate_mode.value
@@ -836,9 +907,11 @@ class FhmoeTuner(TunerCommon):
                     dtype=shape["dtype"],
                     hidden_pad=shape["hidden_pad"],
                     intermediate_pad=shape["intermediate_pad"],
+                    swiglu_limit=shape["swiglu_limit"],
                     gate_mode=gate_mode,
-                    shared_w1=self._to_ref_device(data["shared_w1"]),
-                    shared_w2=self._to_ref_device(data["shared_w2"]),
+                    clamp_shared=self._clamp_shared(shape),
+                    shared_w1=shared_w1,
+                    shared_w2=shared_w2,
                     shared_w1_scale=self._to_ref_device(data["shared_w1_scale"]),
                     shared_w2_scale=self._to_ref_device(data["shared_w2_scale"]),
                     shared_expert_id=data["shared_expert_id"],
@@ -904,7 +977,7 @@ class FhmoeTuner(TunerCommon):
 
     def tune(self, untunedf, tunedf, args):
         del tunedf
-        tasks, in_datas = self._fhmoe_tune_tasks(self._owned_rows(untunedf), args)
+        tasks, in_datas = self._fhmoe_tune_tasks(untunedf, args)
         if not tasks:
             return []
         return mp_tuner(

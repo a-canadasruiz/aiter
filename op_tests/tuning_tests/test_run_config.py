@@ -358,8 +358,9 @@ TUNER_FAMILIES = {
         "config_property": "AITER_CONFIG_FHMOE_FILE",
         # fhmoe_tune.py SystemExits in __main__ off gfx950.
         "required_gfx": "gfx950",
-        # 12 DSV4 rows, distinct FlyDSL pairs. 600s died after token=512 OK.
-        "timeout": 1800,
+        # 12 DSV4 + 16 HY4 rows, distinct FlyDSL pairs. 600s died after the
+        # 10th DSV4 row (token=512).
+        "timeout": 3600,
     },
     "gradlib_bf16": {
         "script": "gradlib/gradlib/gemm_tuner.py",
