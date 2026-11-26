@@ -98,7 +98,9 @@ def _write_header_only(path):
         csv.DictWriter(handle, fieldnames=_NATIVE_FIELDS).writeheader()
 
 
-def _write_untuned_rows(path, tokens):
+def _write_untuned_rows(
+    path, tokens, model_dim=7168, inter_dim=384, intermediate_pad=0
+):
     with open(path, "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=_UNTUNED_FIELDS)
         writer.writeheader()
@@ -106,8 +108,8 @@ def _write_untuned_rows(path, tokens):
             writer.writerow(
                 {
                     "token": token,
-                    "model_dim": 7168,
-                    "inter_dim": 384,
+                    "model_dim": model_dim,
+                    "inter_dim": inter_dim,
                     "expert": 385,
                     "topk": 7,
                     "shared_expert_id": 384,
@@ -119,7 +121,7 @@ def _write_untuned_rows(path, tokens):
                     "use_g1u1": 1,
                     "doweight_stage1": 0,
                     "hidden_pad": 0,
-                    "intermediate_pad": 0,
+                    "intermediate_pad": intermediate_pad,
                     "gate_mode": "GateMode.INTERLEAVE",
                 }
             )
@@ -141,21 +143,23 @@ def _cleanup_stale_lock_files():
                 pass
 
 
-def _child_script(token):
+def _child_script(
+    token, model_dim=7168, inter_dim=384, intermediate_pad=0, swiglu_limit=None
+):
     return textwrap.dedent(f"""\
         import torch
         from aiter import ActivationType, QuantType, dtypes
         from aiter.fused_moe import fused_moe
         from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
         from aiter.ops.flydsl.moe_common import GateMode
-        from aiter.tuning.moe.fhmoe import FhmoeTuner
+        from aiter.tuning.moe.fhmoe import FhmoeTuner, closest_reference_cosine_diff_compare
 
         shape = {{
             "gfx": get_gfx_runtime(),
             "cu_num": int(get_cu_num()),
             "token": {int(token)},
-            "model_dim": 7168,
-            "inter_dim": 384,
+            "model_dim": {int(model_dim)},
+            "inter_dim": {int(inter_dim)},
             "expert": 385,
             "topk": 7,
             "shared_expert_id": 384,
@@ -167,8 +171,9 @@ def _child_script(token):
             "use_g1u1": 1,
             "doweight_stage1": 0,
             "hidden_pad": 0,
-            "intermediate_pad": 0,
+            "intermediate_pad": {int(intermediate_pad)},
             "gate_mode": GateMode.INTERLEAVE,
+            "swiglu_limit": {swiglu_limit!r},
         }}
         data = FhmoeTuner.generate_fhmoe_data(shape)
         to_dev = FhmoeTuner._to_ref_device
@@ -190,7 +195,8 @@ def _child_script(token):
                 w2_scale=to_dev(data["w2_scale"]),
                 dtype=torch.bfloat16,
                 hidden_pad=0,
-                intermediate_pad=0,
+                intermediate_pad=shape["intermediate_pad"],
+                swiglu_limit=shape["swiglu_limit"],
                 gate_mode=GateMode.INTERLEAVE.value,
                 shared_w1=to_dev(data["shared_w1"]),
                 shared_w2=to_dev(data["shared_w2"]),
@@ -201,7 +207,13 @@ def _child_script(token):
         except NotImplementedError as exc:
             print("REPLAY_RAISE", str(exc))
             raise SystemExit(0)
-        print("REPLAY_OK", tuple(out.shape))
+        refs = FhmoeTuner.run_torch_fhmoe_refs(
+            *[data[k] for k in FhmoeTuner._FHMOE_REF_DATA_KEYS], shape
+        )
+        err = closest_reference_cosine_diff_compare(refs, out, printLog=False)
+        assert torch.isfinite(out).all() and out.count_nonzero() > 0
+        assert err <= 0.1, f"public replay differs from reference: {{err}}"
+        print("REPLAY_OK", tuple(out.shape), "cosine_diff", err)
         """)
 
 
@@ -213,12 +225,12 @@ class TestFhmoeReplay(unittest.TestCase):
         if get_gfx() != "gfx950":
             self.skipTest("FHMoE replay requires gfx950")
 
-    def _run_public_op(self, csv_path, token=1, timeout=600):
+    def _run_public_op(self, csv_path, token=1, timeout=600, **shape):
         script_path = os.path.join(
             os.path.dirname(csv_path), f"fhmoe_replay_child_t{token}.py"
         )
         with open(script_path, "w") as handle:
-            handle.write(_child_script(token))
+            handle.write(_child_script(token, **shape))
         env = os.environ.copy()
         env["AITER_CONFIG_FHMOE"] = csv_path
         env["PYTHONPATH"] = AITER_ROOT + os.pathsep + env.get("PYTHONPATH", "")
@@ -233,7 +245,9 @@ class TestFhmoeReplay(unittest.TestCase):
             check=False,
         )
 
-    def _run_fhmoe_tuner(self, untuned_path, tuned_path, timeout=1800):
+    def _run_fhmoe_tuner(
+        self, untuned_path, tuned_path, timeout=1800, swiglu_limit=None
+    ):
         _cleanup_stale_lock_files()
         env = os.environ.copy()
         script_dir = os.path.dirname(_TUNE_SCRIPT)
@@ -250,6 +264,8 @@ class TestFhmoeReplay(unittest.TestCase):
             "--mp",
             "1",
         ]
+        if swiglu_limit is not None:
+            cmd.extend(["--swiglu_limit", str(swiglu_limit)])
         try:
             return subprocess.run(
                 cmd,
@@ -277,6 +293,42 @@ class TestFhmoeReplay(unittest.TestCase):
             )
             self.assertIn("REPLAY_RAISE", result.stdout)
             self.assertIn("does not cover this DSV4 I384", result.stdout)
+
+    def test_flash_tp4_tp8_padded_winners_replay_numerically(self):
+        # Bound the search to two pairs and two token buckets per TP. The real
+        # E/D/I and padding are retained; no production CSV is overwritten.
+        for inter_dim, pad in ((640, 64), (384, 96)):
+            with self.subTest(
+                inter_dim=inter_dim
+            ), tempfile.TemporaryDirectory() as tmp:
+                untuned = os.path.join(tmp, "untuned_fhmoe.csv")
+                tuned = os.path.join(tmp, "tuned_fhmoe.csv")
+                shape = {
+                    "model_dim": 5120,
+                    "inter_dim": inter_dim,
+                    "intermediate_pad": pad,
+                }
+                _write_untuned_rows(untuned, (1, 2), **shape)
+                tune = self._run_fhmoe_tuner(untuned, tuned, swiglu_limit=10)
+                self.assertEqual(
+                    tune.returncode, 0, (tune.stdout + tune.stderr)[-4000:]
+                )
+                with open(tuned, newline="") as handle:
+                    rows = list(csv.DictReader(handle))
+                self.assertEqual({int(row["token"]) for row in rows}, {1, 2})
+                for row in rows:
+                    self.assertEqual(int(row["intermediate_pad"]), pad)
+                    self.assertEqual(row["kernelName1"], _TUNE_KN1)
+                    self.assertIn(row["kernelName2"], _TUNE_KN2S)
+                    result = self._run_public_op(
+                        tuned, token=int(row["token"]), swiglu_limit=10, **shape
+                    )
+                    output = result.stdout + result.stderr
+                    self.assertEqual(result.returncode, 0, output[-4000:])
+                    self.assertIn("REPLAY_OK", result.stdout)
+                    self.assertIn(row["kernelName1"], output)
+                    self.assertIn(row["kernelName2"], output)
+                    self.assertNotIn("REPLAY_RAISE", result.stdout)
 
     def test_tuner_written_csv_selected_by_public_fused_moe(self):
         with tempfile.TemporaryDirectory() as tmp:

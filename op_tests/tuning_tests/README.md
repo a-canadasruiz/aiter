@@ -26,7 +26,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |
 | `test_asm_splitk_guard.py` | 1 | No | `GemmTuner.asm_gemm_all_solutions` SplitK semaphore grid guard |
 | `test_run_config.py` | 2 | Yes | Run --run_config on ALL existing tuned CSVs (configs + model_configs) |
-| `test_fhmoe_dsv4_tuner.py` | 1 | No | `FhmoeTuner` (`aiter/tuning/moe/fhmoe.py`): token buckets and the reduce-buffer token limit, MXFP4 and MXFP8 (HY4) kernel pairs, `--swiglu_limit` and the shared-expert clamp, `post_process`, CSV rewrite, gfx/cu_num guard on the untuned catalogue |
+| `test_fhmoe_dsv4_tuner.py` | 1 | No | `FhmoeTuner` (`aiter/tuning/moe/fhmoe.py`): token buckets and the reduce-buffer token limit, MXFP4 and MXFP8 (HY4) kernel pairs, intermediate padding, `--swiglu_limit` and the shared-expert clamp, `post_process`, CSV rewrite, gfx/cu_num guard on the untuned catalogue |
 | `test_fhmoe_replay.py` | 2 | Yes | `FhmoeTuner` output replayed through the public `fused_moe` in a fresh process (gfx950). Not run by any workflow job |
 
 ## CI coverage
@@ -111,6 +111,60 @@ python3 -m unittest op_tests.tuning_tests.test_run_config -v
 # Everything else
 python3 -m pytest op_tests/tuning_tests -v
 ```
+
+### Tuning DeepSeek-V4.1-Flash with TP4/TP8
+
+The unified tuner supports intermediate padding for routed MXFP4 and shared
+FP8 weights. `inter_dim` is the physical width, including `intermediate_pad`:
+the logical width is `inter_dim - intermediate_pad`. Gate and up are padded
+separately, and W2's corresponding columns are zeroed before quantization.
+Hidden-dimension padding is not supported by this tuner.
+
+The [model configuration](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/raw/main/config.json)
+has hidden size 5120 and logical intermediate size 2304. TP4 divides that into
+576, padded to 640 (`intermediate_pad=64`); TP8 divides it into 288, padded to
+384 (`intermediate_pad=96`). The catalogue includes powers of two from 1 to 2048
+for both, with 384 routed experts plus one shared slot and topk 6+1.
+
+On gfx950, first run the bounded producer/replay test (two pairs, tokens 1 and 2,
+both TP shapes). It compares the public operator against the Torch reference
+after loading the tuner-written CSV in a fresh process:
+
+```bash
+HIP_VISIBLE_DEVICES=0 python3 -m unittest \
+  op_tests.tuning_tests.test_fhmoe_replay.TestFhmoeReplay.test_flash_tp4_tp8_padded_winners_replay_numerically -v
+```
+
+The corresponding CPU/metadata checks (requiring an importable AITER install)
+are:
+
+```bash
+python3 -m unittest op_tests.tuning_tests.test_fhmoe_dsv4_tuner \
+  op_tests.tuning_tests.test_config_shape_collision -v
+python3 -m pytest op_tests/test_fhmoe.py -q -k flash_padded_mxfp4_fhmoe
+```
+
+To prepare an input containing only these shapes, and tune into a separate file:
+
+```bash
+mkdir -p /tmp/flash_fhmoe
+python3 - <<'PY'
+import pandas as pd
+df = pd.read_csv("aiter/configs/untuned_fhmoe.csv")
+df[df.model_dim == 5120].to_csv("/tmp/flash_fhmoe/untuned.csv", index=False)
+PY
+HIP_VISIBLE_DEVICES=0 python3 csrc/ck_gemm_moe_2stages_codegen/fhmoe_tune.py \
+  -i /tmp/flash_fhmoe/untuned.csv -o /tmp/flash_fhmoe/tuned.csv \
+  --swiglu_limit 10 --mp 1
+HIP_VISIBLE_DEVICES=0 python3 csrc/ck_gemm_moe_2stages_codegen/fhmoe_tune.py \
+  -i /tmp/flash_fhmoe/untuned.csv -o /tmp/flash_fhmoe/tuned.csv \
+  --swiglu_limit 10 --run_config /tmp/flash_fhmoe/tuned.csv
+```
+
+The full search can take hours. For serving, point `AITER_CONFIG_FHMOE` at the
+generated file and pass the same padding and clamp limit. The dedicated lookup
+includes padding and requires every token bucket through the requested M.
+The shipped tuned CSV is not changed by these commands.
 
 ### Tuning HY4 heterogeneous MoE
 

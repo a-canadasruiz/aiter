@@ -116,6 +116,22 @@ class TestFhmoeCatalogueSchema(unittest.TestCase):
     def test_parse_row_covers_every_key(self):
         self.assertTrue(set(KEYS) <= set(_shape()))
 
+    def test_flash_tp4_tp8_shapes_include_every_serving_bucket(self):
+        # DeepSeek-V4.1-Flash: hidden=5120, logical MoE intermediate=2304,
+        # 384 routed + 1 shared expert, 6 routed selections + the shared slot.
+        df = _catalogue()
+        for tp in (4, 8):
+            logical = 2304 // tp
+            physical = (logical + 127) // 128 * 128
+            rows = df[(df.model_dim == 5120) & (df.inter_dim == physical)]
+            with self.subTest(tp=tp):
+                self.assertEqual(sorted(rows.token), [2**n for n in range(12)])
+                self.assertEqual(set(rows.intermediate_pad), {physical - logical})
+                self.assertEqual(set(rows.expert), {385})
+                self.assertEqual(set(rows.topk), {7})
+                self.assertEqual(set(rows.shared_expert_id), {384})
+                self.assertEqual(set(rows.hidden_pad), {0})
+
 
 class TestFhmoeLookupToken(unittest.TestCase):
     def test_power_of_two_tokens_are_identity(self):
@@ -145,16 +161,16 @@ class TestFhmoeTuneTasks(unittest.TestCase):
         ):
             tuner._fhmoe_tune_tasks(df, _tune_args())
 
-    def test_mxfp4_row_off_the_dsv4_contract_is_rejected(self):
+    def test_row_outside_the_dedicated_csv_contract_is_rejected(self):
         df = _catalogue().iloc[:1].copy()
-        df["inter_dim"] = 256
+        df["q_dtype_a"] = "torch.bfloat16"
         with (
             mock.patch.object(
                 _tune_module().FhmoeTuner,
                 "_kernel_pairs",
                 side_effect=AssertionError("pairs built for an unserved row"),
             ),
-            self.assertRaisesRegex(ValueError, "DSv4 I384 contract"),
+            self.assertRaisesRegex(ValueError, "FP8 activations"),
         ):
             _tuner()._fhmoe_tune_tasks(df, _tune_args())
 
@@ -319,6 +335,20 @@ class TestFhmoeKernelPairs(unittest.TestCase):
         for _, f1, f2 in filtered:
             self.assertRegex(f"{f1} {f2}", pattern)
 
+    def test_flash_padding_uses_the_physical_intermediate_dimension(self):
+        mod = _tune_module()
+        s2_all = mod.get_flydsl_stage2_kernels("fp8", "fp4", "bf16")
+        for inter_dim, pad in ((640, 64), (384, 96)):
+            shape = dict(
+                _shape(), model_dim=5120, inter_dim=inter_dim, intermediate_pad=pad
+            )
+            with self.subTest(inter_dim=inter_dim):
+                mod.FhmoeTuner._check_served_contract(shape)
+                pairs = self._pairs(shape)
+                self.assertTrue(pairs)
+                for _, _, kn2 in pairs:
+                    self.assertEqual(inter_dim % s2_all[kn2]["tile_k"], 0)
+
     def _catalog_args(self, shape):
         mod = _tune_module()
         with (
@@ -437,6 +467,98 @@ class TestFhmoeSwigluLimit(unittest.TestCase):
                 )
                 limits = [call.kwargs["swiglu_limit"] for call in stage1.call_args_list]
                 self.assertEqual(limits, [10.0, shared_limit])
+
+
+class TestFhmoeIntermediatePadding(unittest.TestCase):
+    def test_padding_preserves_the_logical_mlp(self):
+        zero_padding = _tune_module().FhmoeTuner._zero_intermediate_padding
+        for inter_dim, pad in ((640, 64), (384, 96), (384, 0)):
+            for experts in (1, 3):  # shared and routed weights
+                with self.subTest(inter_dim=inter_dim, pad=pad, experts=experts):
+                    logical = inter_dim - pad
+                    torch.manual_seed(0)
+                    x = torch.randn(2, 32, device="cpu") / 10
+                    w1 = torch.randn(experts, 2 * inter_dim, 32, device="cpu") / 10
+                    w2 = torch.randn(experts, 32, inter_dim, device="cpu") / 10
+                    gate = x @ w1[:, :logical].transpose(-1, -2)
+                    up = x @ w1[:, inter_dim : inter_dim + logical].transpose(-1, -2)
+                    expected = (torch.nn.functional.silu(gate) * up) @ w2[
+                        :, :, :logical
+                    ].transpose(-1, -2)
+                    original_w1, original_w2 = w1.clone(), w2.clone()
+                    zero_padding(w1, w2, pad)
+                    gate, up = (x @ w1.transpose(-1, -2)).chunk(2, dim=-1)
+                    actual = (torch.nn.functional.silu(gate) * up) @ w2.transpose(
+                        -1, -2
+                    )
+                    torch.testing.assert_close(actual, expected)
+                    torch.testing.assert_close(
+                        w1[:, :logical], original_w1[:, :logical]
+                    )
+                    torch.testing.assert_close(
+                        w1[:, inter_dim : inter_dim + logical],
+                        original_w1[:, inter_dim : inter_dim + logical],
+                    )
+                    torch.testing.assert_close(
+                        w2[:, :, :logical], original_w2[:, :, :logical]
+                    )
+
+    def test_generator_zeros_routed_and_shared_weights_before_quantization(self):
+        mod = _tune_module()
+
+        class QuantizationCaptured(Exception):
+            pass
+
+        for inter_dim, pad in ((640, 64), (384, 96)):
+            captured = []
+
+            def capture(dense, q_type, quant_dtype, captured=captured):
+                captured.append(dense.clone())
+                if len(captured) == 4:
+                    raise QuantizationCaptured
+                # Only the routed quantized tensor shapes are needed before
+                # the fourth call. Stop before routing or GPU shuffling.
+                size = list(dense.shape)
+                if quant_dtype == mod.dtypes.fp4x2:
+                    size[-1] //= 2
+                return torch.empty(size, dtype=torch.uint8, device="cpu"), None
+
+            shape = dict(
+                _shape(),
+                model_dim=32,
+                inter_dim=inter_dim,
+                intermediate_pad=pad,
+                expert=3,
+                shared_expert_id=2,
+                topk=2,
+            )
+            with (
+                self.subTest(inter_dim=inter_dim),
+                mock.patch.object(mod, "weight_quant", side_effect=capture),
+                self.assertRaises(QuantizationCaptured),
+            ):
+                mod.FhmoeTuner.generate_fhmoe_data(shape, device="cpu")
+            self.assertEqual(len(captured), 4)
+            logical = inter_dim - pad
+            for w1, w2 in (captured[:2], captured[2:]):
+                self.assertEqual(w1[:, logical:inter_dim].count_nonzero().item(), 0)
+                self.assertEqual(w1[:, inter_dim + logical :].count_nonzero().item(), 0)
+                self.assertEqual(w2[:, :, logical:].count_nonzero().item(), 0)
+                self.assertGreater(w1[:, :logical].count_nonzero().item(), 0)
+                self.assertGreater(w2[:, :, :logical].count_nonzero().item(), 0)
+
+    def test_invalid_padding_is_rejected_before_allocating_data(self):
+        tuner = _tune_module().FhmoeTuner
+        for pad in (-32, 1, 640, 672):
+            with (
+                self.subTest(pad=pad),
+                self.assertRaisesRegex(ValueError, "intermediate_pad"),
+            ):
+                tuner.generate_fhmoe_data(
+                    dict(_shape(), inter_dim=640, intermediate_pad=pad), device="cpu"
+                )
+        with self.assertRaisesRegex(ValueError, "hidden_pad"):
+            tuner.generate_fhmoe_data(dict(_shape(), hidden_pad=32), device="cpu")
 
 
 class TestFhmoePadDummyExpert(unittest.TestCase):
@@ -638,7 +760,7 @@ class TestFhmoeUntunedTargetGuard(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 df = self.tuner.get_untuned_gemm_list(str(UNTUNED_CSV))
         self.assertTrue(df.empty)
-        self.assertIn("[fhmoe] skipping 12 rows", buffer.getvalue())
+        self.assertIn(f"[fhmoe] skipping {len(_catalogue())} rows", buffer.getvalue())
         self.assertIn("gfx950 with 128 CUs", buffer.getvalue())
 
     def test_rows_pinned_to_another_target_are_skipped_with_a_notice(self):
@@ -741,11 +863,16 @@ class TestFhmoeUntunedTargetGuard(unittest.TestCase):
                 self.assertEqual(actual.iloc[2]["kernelName2"], "new_k2")
 
     def test_run_config_keeps_the_already_tuned_rows(self):
-        for run_config, expected in ((False, 0), (True, len(_catalogue()))):
+        # Use already-tuned DSv4 rows: the newly added Flash rows have no
+        # shipped winners until they are measured on the GPU.
+        df = _catalogue()
+        df = df[df.model_dim == 7168]
+        source = self._write(df.to_csv(index=False))
+        for run_config, expected in ((False, 0), (True, len(df))):
             with self.subTest(run_config=run_config):
                 args = SimpleNamespace(
                     all=False,
-                    untune_file=str(UNTUNED_CSV),
+                    untune_file=source,
                     tune_file=str(TUNED_CSV),
                     run_config=run_config,
                 )

@@ -2246,6 +2246,152 @@ def test_hy4_mxfp8_fhmoe_uses_dedicated_config(
     assert metadata.block_m == expected_block_m
 
 
+@pytest.mark.parametrize("inter_dim,intermediate_pad", [(640, 64), (384, 96)])
+def test_flash_padded_mxfp4_fhmoe_uses_dedicated_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    inter_dim: int,
+    intermediate_pad: int,
+):
+    import csv
+    import importlib
+    from types import SimpleNamespace
+
+    from aiter import ActivationType, QuantType
+
+    fhmoe = importlib.import_module("aiter.fhmoe")
+    fmoe = _mock_dsv4_i384_fhmoe_metadata(monkeypatch)
+    kn1 = "flydsl_moe1_afp8_wfp4_bf16_t32x64x256_w4_gui_kw4_fp8"
+    kn2 = "flydsl_moe2_afp8_wfp4_bf16_t32x256x128_atomic_bnt2"
+    row = {
+        "gfx": "gfx950",
+        "cu_num": 256,
+        "token": 1,
+        "model_dim": 5120,
+        "inter_dim": inter_dim,
+        "expert": 385,
+        "topk": 7,
+        "shared_expert_id": 384,
+        "act_type": "ActivationType.Silu",
+        "dtype": str(torch.bfloat16),
+        "q_dtype_a": str(dtypes.fp8),
+        "q_dtype_w": str(dtypes.fp4x2),
+        "q_type": "QuantType.per_1x32",
+        "use_g1u1": 1,
+        "doweight_stage1": 0,
+        "hidden_pad": 0,
+        "intermediate_pad": intermediate_pad,
+        "gate_mode": "GateMode.INTERLEAVE",
+        "block_m": 32,
+        "ksplit": 0,
+        "kernelName1": kn1,
+        "kernelName2": kn2,
+    }
+    config_path = tmp_path / "tuned_fhmoe.csv"
+    with config_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row))
+        writer.writeheader()
+        writer.writerow(row)
+    monkeypatch.setattr(fhmoe, "_fhmoe_config_file", lambda: str(config_path))
+    request = {
+        "model_dim": 5120,
+        "inter_dim": inter_dim,
+        "experts": 385,
+        "topk": 7,
+        "dtype": torch.bfloat16,
+        "q_dtype_w": dtypes.fp4x2,
+        "hidden_pad": 0,
+        "intermediate_pad": intermediate_pad,
+        "gate_mode": GateMode.INTERLEAVE,
+        "doweight_stage1": False,
+    }
+    assert fhmoe._resolve_fhmoe_config_file(1, **request) == str(config_path)
+    metadata = fmoe.get_2stage_cfgs(
+        1,
+        5120,
+        inter_dim,
+        385,
+        7,
+        torch.bfloat16,
+        dtypes.fp8,
+        dtypes.fp4x2,
+        QuantType.per_1x32,
+        True,
+        ActivationType.Silu,
+        False,
+        0,
+        intermediate_pad,
+        True,
+        GateMode.INTERLEAVE,
+        config_file=str(config_path),
+    )
+    assert metadata.stage1.keywords["kernelName"] == kn1
+    assert metadata.stage2.keywords["kernelName"] == kn2
+    assert metadata.stage1.keywords["inter_dim_pad"] == intermediate_pad
+    assert metadata.stage2.keywords["inter_dim_pad"] == intermediate_pad
+    with pytest.raises(ValueError, match="partially matches"):
+        fhmoe._resolve_fhmoe_config_file(1, **dict(request, intermediate_pad=0))
+    with pytest.raises(NotImplementedError, match="does not cover"):
+        fhmoe._resolve_fhmoe_config_file(2, **request)
+    # A matching geometry with another routed dtype is a distinct contract.
+    assert (
+        fhmoe._resolve_fhmoe_config_file(1, **dict(request, q_dtype_w=dtypes.fp8))
+        is None
+    )
+    # Exercise the dispatch entry point without allocating production weights
+    # or launching kernels. Tensor validation is covered by the operator tests.
+    monkeypatch.setattr(fhmoe, "_validate_fhmoe_contract", lambda *args: None)
+    monkeypatch.setattr(fmoe, "_fused_moe_impl", lambda **kwargs: kwargs)
+    call = fhmoe._fhmoe_impl(
+        hidden_states=SimpleNamespace(shape=(1, 5120), dtype=torch.bfloat16),
+        w1=SimpleNamespace(shape=(385, 2 * inter_dim, 2560), dtype=dtypes.fp4x2),
+        w2=SimpleNamespace(shape=(385, 5120, inter_dim // 2), dtype=dtypes.fp4x2),
+        topk_weight=None,
+        topk_ids=SimpleNamespace(shape=(1, 7)),
+        activation=ActivationType.Silu.value,
+        quant_type=QuantType.per_1x32.value,
+        intermediate_pad=intermediate_pad,
+        gate_mode=GateMode.INTERLEAVE.value,
+        shared_expert_id=384,
+    )
+    assert call["_metadata_config_file"] == str(config_path)
+    assert call["intermediate_pad"] == intermediate_pad
+
+
+def test_dsv4_geometry_a4w4_uses_the_generic_path(monkeypatch: pytest.MonkeyPatch):
+    import importlib
+    from types import SimpleNamespace
+
+    from aiter import ActivationType, QuantType
+
+    fhmoe = importlib.import_module("aiter.fhmoe")
+    fmoe = _mock_dsv4_i384_fhmoe_metadata(monkeypatch)
+    config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    monkeypatch.setattr(fhmoe, "_fhmoe_config_file", lambda: str(config_path))
+    assert fhmoe._config_has_fhmoe_geometry(
+        str(config_path),
+        model_dim=7168,
+        inter_dim=384,
+        experts=385,
+        topk=7,
+        q_dtype_w=dtypes.fp4x2,
+    )
+    monkeypatch.setattr(fhmoe, "_validate_fhmoe_contract", lambda *args: None)
+    monkeypatch.setattr(fmoe, "_fused_moe_impl", lambda **kwargs: kwargs)
+    call = fhmoe._fhmoe_impl(
+        hidden_states=SimpleNamespace(shape=(1, 7168), dtype=torch.bfloat16),
+        w1=SimpleNamespace(shape=(385, 768, 3584), dtype=dtypes.fp4x2),
+        w2=SimpleNamespace(shape=(385, 7168, 192), dtype=dtypes.fp4x2),
+        topk_weight=None,
+        topk_ids=SimpleNamespace(shape=(1, 7)),
+        activation=ActivationType.Silu.value,
+        quant_type=QuantType.per_1x32.value,
+        gate_mode=GateMode.SEPARATED.value,
+        shared_expert_id=384,
+    )
+    assert call["_metadata_config_file"] is None
+
+
 def test_hy4_mxfp8_fhmoe_capability(monkeypatch: pytest.MonkeyPatch):
     import importlib
 

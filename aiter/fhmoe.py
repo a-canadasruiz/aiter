@@ -12,10 +12,10 @@ weights/scales, all four shared tensors, and a dummy final routed row identified
 by ``shared_expert_id == E - 1``. Expert bias and expert-mask dispatch are not
 supported.
 
-MXFP8/FP8 rows in ``tuned_fhmoe.csv`` are selected from request geometry,
+MXFP4/FP8 and MXFP8/FP8 rows in ``tuned_fhmoe.csv`` are selected from request geometry,
 dtypes, padding, and gate layout; model identity is not inferred.
 ``clamp_shared`` is an explicit caller-provided semantic. The existing DSV4
-I384 MXFP4/FP8 compatibility path is retained unchanged. Unknown MXFP8
+I384 MXFP4/FP8 compatibility path is retained unchanged. Unknown
 geometries may use generic fallback, while partial matches to dedicated
 geometries fail closed on contract mismatches.
 """
@@ -469,15 +469,18 @@ def _fhmoe_config_file() -> str:
 
 
 @functools.cache
-def _config_has_mxfp8_fhmoe_geometry(
+def _config_has_fhmoe_geometry(
     config_file: str,
     *,
     model_dim: int,
     inter_dim: int,
     experts: int,
     topk: int,
+    q_dtype_w: torch.dtype | None = None,
 ) -> bool:
-    """Return whether the dedicated CSV declares this MXFP8/FP8 geometry."""
+    """Return whether the dedicated CSV declares this geometry and weight dtype."""
+    if q_dtype_w is None:
+        q_dtype_w = dtypes.fp8
     with open(config_file, newline="") as stream:
         rows = csv.DictReader(stream)
         return any(
@@ -486,13 +489,13 @@ def _config_has_mxfp8_fhmoe_geometry(
             and int(row["expert"]) == experts
             and int(row["topk"]) == topk
             and int(row["shared_expert_id"]) == experts - 1
-            and row["q_dtype_w"] == str(dtypes.fp8)
+            and row["q_dtype_w"] == str(q_dtype_w)
             for row in rows
         )
 
 
 @functools.cache
-def _config_has_mxfp8_fhmoe_contract(
+def _config_has_fhmoe_contract(
     config_file: str,
     *,
     model_dim: int,
@@ -504,14 +507,18 @@ def _config_has_mxfp8_fhmoe_contract(
     intermediate_pad: int,
     gate_mode: GateMode,
     doweight_stage1: bool,
+    q_dtype_w: torch.dtype | None = None,
 ) -> bool:
-    """Return whether the dedicated CSV declares this full MXFP8 contract."""
-    if not _config_has_mxfp8_fhmoe_geometry(
+    """Return whether the dedicated CSV declares this full FHMoE contract."""
+    if q_dtype_w is None:
+        q_dtype_w = dtypes.fp8
+    if not _config_has_fhmoe_geometry(
         config_file,
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=experts,
         topk=topk,
+        q_dtype_w=q_dtype_w,
     ):
         return False
     with open(config_file, newline="") as stream:
@@ -525,7 +532,7 @@ def _config_has_mxfp8_fhmoe_contract(
             and row["act_type"] == str(ActivationType.Silu)
             and row["dtype"] == str(dtype)
             and row["q_dtype_a"] == str(dtypes.fp8)
-            and row["q_dtype_w"] == str(dtypes.fp8)
+            and row["q_dtype_w"] == str(q_dtype_w)
             and row["q_type"] == str(QuantType.per_1x32)
             and int(row["use_g1u1"]) == 1
             and int(row["doweight_stage1"]) == int(doweight_stage1)
@@ -625,7 +632,7 @@ def supports_dsv4_i384_fhmoe(max_tokens: int) -> bool:
 
 
 @functools.cache
-def _supports_mxfp8_fhmoe_config(
+def _supports_tuned_fhmoe_config(
     max_tokens: int,
     config_file: str,
     *,
@@ -640,7 +647,10 @@ def _supports_mxfp8_fhmoe_config(
     doweight_stage1: bool,
     force_reduce: bool,
     stage2_fp8: bool,
+    q_dtype_w: torch.dtype | None = None,
 ) -> bool:
+    if q_dtype_w is None:
+        q_dtype_w = dtypes.fp8
     try:
         from aiter.fused_moe import (
             _flydsl_route_output_nbytes,
@@ -664,7 +674,7 @@ def _supports_mxfp8_fhmoe_config(
                 topk,
                 dtype,
                 dtypes.fp8,
-                dtypes.fp8,
+                q_dtype_w,
                 QuantType.per_1x32,
                 True,
                 ActivationType.Silu,
@@ -681,7 +691,7 @@ def _supports_mxfp8_fhmoe_config(
                 model_dim=model_dim,
                 dtype=dtype,
                 q_dtype_a=dtypes.fp8,
-                q_dtype_w=dtypes.fp8,
+                q_dtype_w=q_dtype_w,
                 gate_mode=gate_mode,
             ):
                 return False
@@ -721,7 +731,7 @@ def _supports_mxfp8_fhmoe_config(
     return True
 
 
-def supports_mxfp8_fhmoe_config(
+def supports_fhmoe_config(
     max_tokens: int,
     *,
     model_dim: int,
@@ -733,8 +743,9 @@ def supports_mxfp8_fhmoe_config(
     intermediate_pad: int,
     gate_mode: GateMode,
     doweight_stage1: bool,
+    q_dtype_w: torch.dtype | None = None,
 ) -> bool:
-    """Return whether dedicated MXFP8/FP8 coverage is executable through M."""
+    """Return whether dedicated FHMoE coverage is executable through M."""
     if type(max_tokens) is not int or max_tokens <= 0:
         return False
     try:
@@ -745,7 +756,7 @@ def supports_mxfp8_fhmoe_config(
         config_file = _fhmoe_config_file()
     except (ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError):
         return False
-    return _supports_mxfp8_fhmoe_config(
+    return _supports_tuned_fhmoe_config(
         max_tokens,
         config_file,
         model_dim=model_dim,
@@ -759,10 +770,11 @@ def supports_mxfp8_fhmoe_config(
         doweight_stage1=doweight_stage1,
         force_reduce=os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1",
         stage2_fp8=os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1",
+        q_dtype_w=q_dtype_w,
     )
 
 
-def _resolve_mxfp8_fhmoe_config_file(
+def _resolve_fhmoe_config_file(
     max_tokens: int,
     *,
     model_dim: int,
@@ -774,19 +786,21 @@ def _resolve_mxfp8_fhmoe_config_file(
     intermediate_pad: int,
     gate_mode: GateMode,
     doweight_stage1: bool,
+    q_dtype_w: torch.dtype | None = None,
 ) -> str | None:
-    """Resolve a dedicated MXFP8 config, failing closed on partial matches."""
+    """Resolve a dedicated FHMoE config, failing closed on partial matches."""
     config_file = _fhmoe_config_file()
-    has_geometry = _config_has_mxfp8_fhmoe_geometry(
+    has_geometry = _config_has_fhmoe_geometry(
         config_file,
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=experts,
         topk=topk,
+        q_dtype_w=q_dtype_w,
     )
     if not has_geometry:
         return None
-    has_contract = _config_has_mxfp8_fhmoe_contract(
+    has_contract = _config_has_fhmoe_contract(
         config_file,
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -797,14 +811,15 @@ def _resolve_mxfp8_fhmoe_config_file(
         intermediate_pad=intermediate_pad,
         gate_mode=gate_mode,
         doweight_stage1=doweight_stage1,
+        q_dtype_w=q_dtype_w,
     )
     if not has_contract:
         raise ValueError(
-            "MXFP8/FP8 FHMoE request partially matches a dedicated CSV "
+            "FHMoE request partially matches a dedicated CSV "
             "contract but differs in dtype, padding, gate mode, or "
             "doweight_stage1"
         )
-    if not supports_mxfp8_fhmoe_config(
+    if not supports_fhmoe_config(
         max_tokens,
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -815,12 +830,21 @@ def _resolve_mxfp8_fhmoe_config_file(
         intermediate_pad=intermediate_pad,
         gate_mode=gate_mode,
         doweight_stage1=doweight_stage1,
+        q_dtype_w=q_dtype_w,
     ):
         raise NotImplementedError(
-            "The dedicated MXFP8/FP8 FHMoE config does not cover "
+            "The dedicated FHMoE config does not cover "
             f"this request at M={max_tokens}"
         )
     return config_file
+
+
+# Existing MXFP8 callers keep their entry points and default weight dtype.
+_config_has_mxfp8_fhmoe_geometry = _config_has_fhmoe_geometry
+_config_has_mxfp8_fhmoe_contract = _config_has_fhmoe_contract
+_supports_mxfp8_fhmoe_config = _supports_tuned_fhmoe_config
+supports_mxfp8_fhmoe_config = supports_fhmoe_config
+_resolve_mxfp8_fhmoe_config_file = _resolve_fhmoe_config_file
 
 
 def _is_dsv4_i384_fhmoe_contract(
@@ -1027,9 +1051,9 @@ def _fhmoe_impl(
         from aiter.jit.core import AITER_CONFIGS
 
         metadata_config_file = AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE
-    elif w1.dtype == dtypes.fp8:
+    elif gate_mode_enum == GateMode.INTERLEAVE:
         request_dtype = hidden_states.dtype if dtype is None else dtype
-        metadata_config_file = _resolve_mxfp8_fhmoe_config_file(
+        metadata_config_file = _resolve_fhmoe_config_file(
             hidden_states.shape[0],
             model_dim=model_dim,
             inter_dim=inter_dim,
@@ -1040,6 +1064,7 @@ def _fhmoe_impl(
             intermediate_pad=intermediate_pad,
             gate_mode=gate_mode_enum,
             doweight_stage1=doweight_stage1,
+            q_dtype_w=w1.dtype,
         )
     return _fused_moe_impl(
         hidden_states=hidden_states,

@@ -14,7 +14,7 @@ import torch
 
 import aiter
 from aiter import ActivationType, QuantType, dtypes
-from aiter.fhmoe import _is_dsv4_i384_fhmoe_contract, _use_fhmoe_wrappers
+from aiter.fhmoe import _use_fhmoe_wrappers
 from aiter.fhmoe_contract import max_fhmoe_reduce_tokens
 from aiter.fused_moe import (
     _fused_moe_impl,
@@ -69,7 +69,8 @@ class FhmoeTuner(TunerCommon):
             type=float,
             default=None,
             help="SiLU gate/up clamp used while timing and in the reference "
-            "(HY4 serves with 10). The CSV has no column for it, so tune every "
+            "(HY4 and DeepSeek-V4.1-Flash serve with 10). The CSV has no column "
+            "for it, so tune every "
             "row of one tuned file with the same limit.",
         )
 
@@ -159,23 +160,39 @@ class FhmoeTuner(TunerCommon):
 
     @staticmethod
     def _check_served_contract(shape):
-        contract = {
-            "model_dim": shape["model_dim"],
-            "inter_dim": shape["inter_dim"],
-            "experts": shape["expert"],
-            "topk": shape["topk"],
-            "hidden_pad": shape["hidden_pad"],
-            "intermediate_pad": shape["intermediate_pad"],
-            "gate_mode": shape["gate_mode"],
-            "doweight_stage1": bool(shape["doweight_stage1"]),
-        }
-        if shape["q_dtype_w"] == dtypes.fp4x2 and not _is_dsv4_i384_fhmoe_contract(
-            **contract
+        # The dedicated CSV resolver accepts both routed weight dtypes, with
+        # FP8 activations and interleaved gate/up. Validate that same contract.
+        if (
+            shape["act_type"] != ActivationType.Silu
+            or shape["q_type"] != QuantType.per_1x32
+            or shape["q_dtype_a"] != dtypes.fp8
+            or shape["q_dtype_w"] not in (dtypes.fp4x2, dtypes.fp8)
+            or shape["use_g1u1"] != 1
+            or shape["gate_mode"] != GateMode.INTERLEAVE
+            or shape["shared_expert_id"] != shape["expert"] - 1
         ):
             raise ValueError(
-                "aiter.fhmoe reads tuned_fhmoe.csv for MXFP4 rows only on the "
-                f"DSv4 I384 contract, so this row would never be served: {contract}"
+                "FHMoE tuning requires SiLU, per_1x32, FP8 activations, MXFP4 or "
+                "MXFP8 routed weights, interleaved gate/up, and a final shared expert"
             )
+        if shape["hidden_pad"] != 0:
+            raise ValueError("FHMoE tuning does not support hidden_pad")
+        pad = shape["intermediate_pad"]
+        if not 0 <= pad < shape["inter_dim"] or pad % 32:
+            raise ValueError(
+                "intermediate_pad must be a nonnegative multiple of 32 smaller "
+                "than the physical inter_dim"
+            )
+
+    @staticmethod
+    def _zero_intermediate_padding(w1, w2, pad):
+        if not pad:
+            return
+        inter_dim = w2.shape[-1]
+        # W1 is [gate, up] before shuffling: pad each projection separately.
+        w1[:, inter_dim - pad : inter_dim, :].zero_()
+        w1[:, 2 * inter_dim - pad :, :].zero_()
+        w2[:, :, inter_dim - pad :].zero_()
 
     @staticmethod
     def _pad_dummy_expert(tensor, n_experts=None):
@@ -190,6 +207,7 @@ class FhmoeTuner(TunerCommon):
 
     @staticmethod
     def generate_fhmoe_data(shape, block_m=32, device="cuda"):
+        FhmoeTuner._check_served_contract(shape)
         expert = shape["expert"]
         topk = shape["topk"]
         shared_expert_id = shape["shared_expert_id"]
@@ -227,6 +245,9 @@ class FhmoeTuner(TunerCommon):
         w2_dense = torch.randn(
             (routed_expert, model_dim, inter_dim), dtype=dtype, device="cpu"
         )
+        FhmoeTuner._zero_intermediate_padding(
+            w1_dense, w2_dense, shape["intermediate_pad"]
+        )
         w1_shape = w1_dense.shape
         w2_shape = w2_dense.shape
         with torch.device("cpu"):
@@ -257,6 +278,9 @@ class FhmoeTuner(TunerCommon):
         )
         shared_w2_dense = (
             torch.randn((1, model_dim, inter_dim), dtype=dtype, device="cpu") / 10
+        )
+        FhmoeTuner._zero_intermediate_padding(
+            shared_w1_dense, shared_w2_dense, shape["intermediate_pad"]
         )
         # Shared expert is FP8 in the FHMoE contract (aiter/fhmoe.py), not a
         # column of the CSV. Routed weights use shape["q_dtype_w"] above.
